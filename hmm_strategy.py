@@ -64,8 +64,13 @@ def compute_features(trajectory):
     return features
 
 
-def build_training_data(tokens, min_hours=10):
+def build_training_data(tokens, min_hours=10, normalize_per_token=True):
     """Pool features from all tokens into one training dataset.
+
+    If normalize_per_token is True, z-score each token's features independently
+    before pooling. This prevents the HMM from being dominated by the overall
+    downward trend of most tokens, and instead learns relative patterns
+    (accelerating vs decelerating within each token's own context).
 
     Returns (concatenated_features, lengths) for hmmlearn's fit().
     """
@@ -79,6 +84,13 @@ def build_training_data(tokens, min_hours=10):
         features = compute_features(traj)
         if features is None or len(features) < 5:
             continue
+
+        if normalize_per_token:
+            mean = features.mean(axis=0)
+            std = features.std(axis=0)
+            std[std == 0] = 1.0
+            features = (features - mean) / std
+
         all_features.append(features)
         lengths.append(len(features))
 
@@ -181,8 +193,14 @@ class HMMStrategy:
         if features is None or len(features) < 3:
             return None
 
+        # Normalize per-token to match training (z-score)
+        mean = features.mean(axis=0)
+        std = features.std(axis=0)
+        std[std == 0] = 1.0
+        features_norm = (features - mean) / std
+
         # Get per-timestep state probabilities (online filtering via forward algo)
-        log_prob, posteriors = self.model.score_samples(features)
+        log_prob, posteriors = self.model.score_samples(features_norm)
         growth_prob = posteriors[:, self.growth_state]
 
         T = len(features)
