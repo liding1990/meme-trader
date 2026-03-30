@@ -87,7 +87,9 @@ class Strategy5m:
 
             if not in_trade:
                 # --- ENTRY CONDITIONS ---
-                if mcap < self.min_mcap:
+                # min_mcap filter: skip if data looks like mcap (>100) and below threshold
+                # Codex data is price (<1), GMGN data is mcap (>1000) — auto-detect
+                if mcap > 100 and mcap < self.min_mcap:
                     continue
 
                 roc = row.get("roc_30m", 0)
