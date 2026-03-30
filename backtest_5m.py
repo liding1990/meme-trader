@@ -102,6 +102,11 @@ class Strategy5m:
                             rvol > self.rvol_entry_threshold and
                             roc_accel > 0)
 
+                # OFI confirmation: if buy/sell data available, require net buying pressure
+                ofi = row.get("ofi_30m", np.nan)
+                if entry_ok and not pd.isna(ofi) and ofi < 0:
+                    entry_ok = False  # no entry if selling pressure dominates
+
                 # Multi-bar confirmation: previous bar also had positive ROC
                 if entry_ok and self.require_multi_bar_confirmation and idx >= 1:
                     prev_roc = df.iloc[idx - 1].get("roc_30m", 0)

@@ -65,9 +65,22 @@ def compute_buy_sell_ratio(buy_volume, sell_volume, window=6):
     return buy_sum / sell_sum.replace(0, np.nan)
 
 
-def compute_all_indicators(df):
-    """Compute all P4 indicators on a DataFrame with columns: mcap, volume.
+def compute_ofi(buy_volume, sell_volume, window=6):
+    """Order Flow Imbalance: net buying pressure in [-1, 1].
 
+    OFI > 0.3 = strong buying pressure
+    OFI < -0.3 = strong selling pressure
+    """
+    buy_sum = buy_volume.rolling(window, min_periods=1).sum()
+    sell_sum = sell_volume.rolling(window, min_periods=1).sum()
+    total = buy_sum + sell_sum
+    return (buy_sum - sell_sum) / total.replace(0, np.nan)
+
+
+def compute_all_indicators(df):
+    """Compute all indicators on a DataFrame.
+
+    Supports both GMGN data (mcap, volume) and Codex data (+ buy_volume, sell_volume, buyers, sellers).
     Returns DataFrame with all indicator columns added.
     """
     result = df.copy()
@@ -85,6 +98,32 @@ def compute_all_indicators(df):
 
     # Relative volume
     result["rvol"] = compute_rvol(volume)
+
+    # Buy/sell indicators (Codex data only)
+    if "buy_volume" in result.columns and result["buy_volume"].sum() > 0:
+        bv = result["buy_volume"].fillna(0)
+        sv = result["sell_volume"].fillna(0)
+
+        # Order Flow Imbalance (rolling 30min = 6 bars)
+        result["ofi_30m"] = compute_ofi(bv, sv, window=6)
+        result["ofi_1h"] = compute_ofi(bv, sv, window=12)
+
+        # Buy/sell ratio (rolling)
+        result["bs_ratio"] = compute_buy_sell_ratio(bv, sv, window=6)
+
+        # Buyer/seller count ratio
+        if "buyers" in result.columns:
+            buyers = result["buyers"].fillna(0)
+            sellers = result["sellers"].fillna(0).replace(0, np.nan)
+            result["buyer_seller_ratio"] = (
+                buyers.rolling(6, min_periods=1).sum() /
+                sellers.rolling(6, min_periods=1).sum()
+            )
+    else:
+        result["ofi_30m"] = np.nan
+        result["ofi_1h"] = np.nan
+        result["bs_ratio"] = np.nan
+        result["buyer_seller_ratio"] = np.nan
 
     return result
 
@@ -122,6 +161,10 @@ def generate_trade_management_signals(indicators_df):
         rvol_signal = np.clip((df["rvol"] - 1) / 3, -1, 1)  # RVOL=4 → signal=1
         signals.append(rvol_signal)
 
+    # OFI signal (if available)
+    if "ofi_30m" in df.columns and df["ofi_30m"].notna().any():
+        signals.append(df["ofi_30m"].fillna(0))  # already in [-1, 1]
+
     if signals:
         df["momentum_quality"] = pd.concat(signals, axis=1).mean(axis=1)
     else:
@@ -132,6 +175,10 @@ def generate_trade_management_signals(indicators_df):
         (df.get("roc_accel_30m", 0) < 0) &
         (df.get("macd_hist_slope", 0) < 0)
     )
+    # OFI turning negative = selling pressure = tighten stop
+    if "ofi_30m" in df.columns:
+        df["tighten_stop"] = df["tighten_stop"] | (df["ofi_30m"].fillna(0) < -0.3)
+
     df["extend_hold"] = (
         (df.get("roc_accel_30m", 0) > 0) &
         (df.get("rvol", 0) > 2)
@@ -141,11 +188,30 @@ def generate_trade_management_signals(indicators_df):
 
 
 def extract_5m_candles(address):
-    """Load 5-minute candle data from cached JSON."""
+    """Load 5-minute candle data. Prefers Codex (has buy/sell volume), falls back to GMGN."""
     import os
     import json
     import glob
 
+    # Try Codex data first (has buy/sell volume)
+    codex_file = os.path.join("data", "codex", f"{address}_5m.json")
+    if os.path.isfile(codex_file):
+        with open(codex_file) as f:
+            bars = json.load(f)
+        if bars:
+            df = pd.DataFrame(bars)
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            # Codex close is price, compute mcap proxy (use close directly)
+            if "close" in df.columns and "mcap" not in df.columns:
+                df["mcap"] = df["close"]
+            df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
+            # Ensure buy/sell columns exist
+            for col in ["buy_volume", "sell_volume", "buyers", "sellers"]:
+                if col not in df.columns:
+                    df[col] = 0
+            return df
+
+    # Fall back to GMGN data (no buy/sell volume)
     data_dir = os.path.join("data", address)
     files = sorted(glob.glob(os.path.join(data_dir, "token_mcap_candles_5m_*.json")))
     if not files:
@@ -170,6 +236,10 @@ def extract_5m_candles(address):
             "high": float(c.get("high", 0)),
             "low": float(c.get("low", 0)),
             "open": float(c.get("open", 0)),
+            "buy_volume": 0,
+            "sell_volume": 0,
+            "buyers": 0,
+            "sellers": 0,
         })
 
     df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
