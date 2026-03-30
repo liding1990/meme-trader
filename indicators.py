@@ -71,20 +71,24 @@ def compute_hurst(series, min_window=4, max_window=None):
     return float(np.clip(hurst, 0, 1))
 
 
-def compute_rolling_hurst(series, window=48):
+def compute_rolling_hurst(series, window=48, step=12):
     """Compute rolling Hurst exponent over a window.
 
     window=48 = 4 hours of 5-min bars.
+    step=12: only compute every 12 bars (1 hour) for speed, forward-fill between.
     """
-    result = pd.Series(0.5, index=series.index)
+    result = np.full(len(series), 0.5)
     values = series.values
 
+    last_hurst = 0.5
     for i in range(window, len(values)):
-        chunk = values[i - window:i]
-        if np.std(chunk) > 0:
-            result.iloc[i] = compute_hurst(chunk)
+        if i % step == 0:
+            chunk = values[i - window:i]
+            if np.std(chunk) > 0:
+                last_hurst = compute_hurst(chunk)
+        result[i] = last_hurst
 
-    return result
+    return pd.Series(result, index=series.index)
 
 
 def compute_roc(series, period):
@@ -115,6 +119,144 @@ def compute_macd(series, fast=6, slow=13, signal=5):
     histogram = macd_line - signal_line
     histogram_slope = histogram.diff()
     return macd_line, signal_line, histogram, histogram_slope
+
+
+def ehlers_roofing_filter(close, hp_period=48, lp_period=10):
+    """Ehlers Roofing Filter: high-pass (remove trend) + Super Smoother (remove noise).
+
+    Extracts the "useful" frequency band from price data.
+    """
+    src = close.values.astype(float)
+    n = len(src)
+
+    angle_hp = 0.707 * 2.0 * np.pi / hp_period
+    alpha_hp = (np.cos(angle_hp) + np.sin(angle_hp) - 1.0) / np.cos(angle_hp)
+
+    a1 = np.exp(-np.sqrt(2.0) * np.pi / lp_period)
+    b1 = 2.0 * a1 * np.cos(np.sqrt(2.0) * np.pi / lp_period)
+    c2, c3 = b1, -a1 * a1
+    c1 = 1.0 - c2 - c3
+
+    hp = np.zeros(n)
+    filt = np.zeros(n)
+
+    for i in range(2, n):
+        if np.isnan(src[i]):
+            hp[i] = hp[i - 1]
+            continue
+        hp[i] = ((1.0 - alpha_hp / 2.0) ** 2 * (src[i] - 2.0 * src[i - 1] + src[i - 2])
+                 + 2.0 * (1.0 - alpha_hp) * hp[i - 1]
+                 - (1.0 - alpha_hp) ** 2 * hp[i - 2])
+
+    for i in range(2, n):
+        filt[i] = c1 * (hp[i] + hp[i - 1]) / 2.0 + c2 * filt[i - 1] + c3 * filt[i - 2]
+
+    return pd.Series(filt, index=close.index)
+
+
+def ehlers_fisher_transform(close, period=10):
+    """Ehlers Fisher Transform: converts price to Gaussian, sharp turning points.
+
+    Returns (fisher, signal) Series. Fisher crossing Signal = regime change.
+    """
+    src = close.values.astype(float)
+    n = len(src)
+
+    mid = src  # use close directly (or roofing filter output)
+    value = np.zeros(n)
+    fisher = np.zeros(n)
+
+    for i in range(period, n):
+        window = mid[i - period + 1:i + 1]
+        max_h = np.nanmax(window)
+        min_l = np.nanmin(window)
+        rng = max_h - min_l
+        if rng > 0:
+            raw = 2.0 * ((mid[i] - min_l) / rng - 0.5)
+        else:
+            raw = 0.0
+
+        value[i] = 0.33 * raw + 0.67 * value[i - 1]
+        value[i] = np.clip(value[i], -0.999, 0.999)
+
+        fisher[i] = 0.5 * np.log((1.0 + value[i]) / (1.0 - value[i]))
+        fisher[i] = 0.5 * fisher[i] + 0.5 * fisher[i - 1]
+
+    fisher_s = pd.Series(fisher, index=close.index)
+    signal_s = fisher_s.shift(1)
+    return fisher_s, signal_s
+
+
+def ehlers_ebsw(close, hp_period=40, lp_period=10):
+    """Ehlers Even Better Sinewave: detects trending vs cycling market.
+
+    EBSW > 0: market is trending (momentum strategy active)
+    EBSW < 0: market is cycling/choppy (sit out)
+    """
+    src = close.values.astype(float)
+    n = len(src)
+
+    angle_hp = 0.707 * 2.0 * np.pi / hp_period
+    alpha_hp = (np.cos(angle_hp) + np.sin(angle_hp) - 1.0) / np.cos(angle_hp)
+
+    a1 = np.exp(-np.sqrt(2.0) * np.pi / lp_period)
+    b1 = 2.0 * a1 * np.cos(np.sqrt(2.0) * np.pi / lp_period)
+    c2, c3 = b1, -a1 * a1
+    c1 = 1.0 - c2 - c3
+
+    hp = np.zeros(n)
+    filt = np.zeros(n)
+    ebsw = np.zeros(n)
+
+    for i in range(2, n):
+        if np.isnan(src[i]):
+            hp[i] = hp[i - 1]
+            continue
+        hp[i] = ((1.0 - alpha_hp / 2.0) ** 2 * (src[i] - 2.0 * src[i - 1] + src[i - 2])
+                 + 2.0 * (1.0 - alpha_hp) * hp[i - 1]
+                 - (1.0 - alpha_hp) ** 2 * hp[i - 2])
+
+    for i in range(2, n):
+        filt[i] = c1 * (hp[i] + hp[i - 1]) / 2.0 + c2 * filt[i - 1] + c3 * filt[i - 2]
+
+    for i in range(1, n):
+        pwr = (filt[i] ** 2 + filt[i - 1] ** 2) / 2.0
+        wave = filt[i] / np.sqrt(pwr) if pwr > 0 else 0.0
+        wave = np.clip(wave, -1.0, 1.0)
+        ebsw[i] = 0.67 * wave + 0.33 * ebsw[i - 1]
+
+    return pd.Series(ebsw, index=close.index)
+
+
+def ehlers_instantaneous_trendline(close, period=10):
+    """Ehlers Instantaneous Trendline (Super Smoother): minimal-lag trend.
+
+    Returns (itrend, trigger) Series. Price above itrend = uptrend.
+    Trigger leads itrend for early warning.
+    """
+    src = close.values.astype(float)
+    n = len(src)
+
+    a1 = np.exp(-np.sqrt(2.0) * np.pi / period)
+    b1 = 2.0 * a1 * np.cos(np.sqrt(2.0) * np.pi / period)
+    c2, c3 = b1, -a1 * a1
+    c1 = 1.0 - c2 - c3
+
+    itrend = np.zeros(n)
+    itrend[0] = src[0] if not np.isnan(src[0]) else 0.0
+    if n > 1:
+        itrend[1] = src[1] if not np.isnan(src[1]) else itrend[0]
+
+    for i in range(2, n):
+        if np.isnan(src[i]):
+            itrend[i] = itrend[i - 1]
+        else:
+            itrend[i] = c1 * (src[i] + src[i - 1]) / 2.0 + c2 * itrend[i - 1] + c3 * itrend[i - 2]
+
+    trigger = 2.0 * itrend - np.roll(itrend, 2)
+    trigger[:2] = itrend[:2]
+
+    return pd.Series(itrend, index=close.index), pd.Series(trigger, index=close.index)
 
 
 def compute_rvol(volume, window=48):
@@ -166,8 +308,21 @@ def compute_all_indicators(df):
     result["roc_1h"], result["roc_accel_1h"] = compute_roc_acceleration(mcap, roc_period=12, accel_period=6)
     result["roc_3h"], result["roc_accel_3h"] = compute_roc_acceleration(mcap, roc_period=36, accel_period=12)
 
-    # MACD
+    # MACD (kept for backward compatibility / meta-model features)
     result["macd"], result["macd_signal"], result["macd_hist"], result["macd_hist_slope"] = compute_macd(mcap)
+
+    # Ehlers DSP indicators (replace MACD as primary signals)
+    # 1. Roofing filter → Fisher Transform (sharp turning points, replaces MACD crossover)
+    roofed = ehlers_roofing_filter(mcap, hp_period=48, lp_period=10)
+    result["fisher"], result["fisher_signal"] = ehlers_fisher_transform(roofed, period=8)
+    result["fisher_cross"] = (result["fisher"] - result["fisher_signal"]).apply(np.sign)
+
+    # 2. Even Better Sinewave (trending vs cycling regime filter)
+    result["ebsw"] = ehlers_ebsw(mcap, hp_period=40, lp_period=10)
+
+    # 3. Instantaneous Trendline (minimal-lag trend confirmation)
+    result["itrend"], result["itrend_trigger"] = ehlers_instantaneous_trendline(mcap, period=10)
+    result["above_itrend"] = (mcap > result["itrend"]).astype(int)
 
     # Relative volume
     result["rvol"] = compute_rvol(volume)
@@ -225,12 +380,16 @@ def generate_trade_management_signals(indicators_df):
             if std > 0:
                 signals.append(np.clip(s / std, -2, 2) / 2)  # normalize to ~[-1, 1]
 
-    # MACD histogram slope: positive = good
-    if "macd_hist_slope" in df.columns:
-        s = df["macd_hist_slope"]
-        std = s.std()
+    # Ehlers Fisher Transform: positive = bullish momentum
+    if "fisher" in df.columns:
+        fisher = df["fisher"]
+        std = fisher.std()
         if std > 0:
-            signals.append(np.clip(s / std, -2, 2) / 2)
+            signals.append(np.clip(fisher / std, -2, 2) / 2)
+
+    # Ehlers EBSW: > 0 = trending (good for momentum), < 0 = cycling (bad)
+    if "ebsw" in df.columns:
+        signals.append(df["ebsw"].fillna(0))  # already in [-1, 1]
 
     # RVOL: high = good (but normalize differently)
     if "rvol" in df.columns:
@@ -247,10 +406,18 @@ def generate_trade_management_signals(indicators_df):
         df["momentum_quality"] = 0.0
 
     # Trade management signals
-    df["tighten_stop"] = (
-        (df.get("roc_accel_30m", 0) < 0) &
-        (df.get("macd_hist_slope", 0) < 0)
-    )
+    # Tighten stop when: ROC decelerating + Fisher turning down OR EBSW going negative
+    df["tighten_stop"] = (df.get("roc_accel_30m", 0) < 0)
+
+    # Fisher crossing signal downward = momentum fading
+    if "fisher_cross" in df.columns:
+        fisher_turning = (df["fisher_cross"] < 0) & (df["fisher_cross"].shift(1) >= 0)
+        df["tighten_stop"] = df["tighten_stop"] | fisher_turning
+
+    # EBSW going negative = cycling market = tighten
+    if "ebsw" in df.columns:
+        df["tighten_stop"] = df["tighten_stop"] | (df["ebsw"] < -0.3)
+
     # OFI turning negative = selling pressure = tighten stop
     if "ofi_30m" in df.columns:
         df["tighten_stop"] = df["tighten_stop"] | (df["ofi_30m"].fillna(0) < -0.3)

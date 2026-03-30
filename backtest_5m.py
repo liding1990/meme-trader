@@ -104,6 +104,16 @@ class Strategy5m:
                             rvol > self.rvol_entry_threshold and
                             roc_accel > 0)
 
+                # Ehlers EBSW regime filter: only trade in trending markets
+                ebsw = row.get("ebsw", np.nan)
+                if entry_ok and not pd.isna(ebsw) and ebsw < 0:
+                    entry_ok = False  # cycling market = sit out
+
+                # Ehlers price above ITrend = uptrend confirmation
+                above_itrend = row.get("above_itrend", 1)
+                if entry_ok and above_itrend == 0:
+                    entry_ok = False  # below trendline = no long entry
+
                 # OFI confirmation: if buy/sell data available, require net buying pressure
                 ofi = row.get("ofi_30m", np.nan)
                 if entry_ok and not pd.isna(ofi) and ofi < 0:

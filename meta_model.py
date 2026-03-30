@@ -60,10 +60,18 @@ def extract_trade_features(trades, token_dfs):
             "roc_1h": row.get("roc_1h", np.nan),
             "roc_accel_30m": row.get("roc_accel_30m", np.nan),
             "roc_accel_1h": row.get("roc_accel_1h", np.nan),
-            "macd_hist": row.get("macd_hist", np.nan),
-            "macd_hist_slope": row.get("macd_hist_slope", np.nan),
             "rvol": row.get("rvol", np.nan),
             "momentum_quality": row.get("momentum_quality", np.nan),
+
+            # Ehlers DSP indicators
+            "fisher": row.get("fisher", np.nan),
+            "fisher_cross": row.get("fisher_cross", np.nan),
+            "ebsw": row.get("ebsw", np.nan),
+            "above_itrend": row.get("above_itrend", np.nan),
+
+            # Legacy (kept for comparison)
+            "macd_hist": row.get("macd_hist", np.nan),
+            "macd_hist_slope": row.get("macd_hist_slope", np.nan),
 
             # P3: Trend strength
             "hurst": row.get("hurst", np.nan),
@@ -114,8 +122,11 @@ def build_dataset(tokens, strategy, kmf):
 
 FEATURE_COLS = [
     "roc_30m", "roc_1h", "roc_accel_30m", "roc_accel_1h",
-    "macd_hist", "macd_hist_slope", "rvol", "momentum_quality",
-    "hurst", "ofi_30m", "ofi_1h", "bs_ratio", "buyer_seller_ratio",
+    "rvol", "momentum_quality",
+    "fisher", "fisher_cross", "ebsw", "above_itrend",
+    "macd_hist", "macd_hist_slope",
+    "hurst",
+    "ofi_30m", "ofi_1h", "bs_ratio", "buyer_seller_ratio",
     "volume", "buy_volume", "sell_volume", "liquidity",
 ]
 
