@@ -11,7 +11,7 @@ import pickle
 import numpy as np
 import pandas as pd
 
-from codex_api import filter_tokens, get_token_bars, SOLANA_NETWORK_ID
+from codex_api import filter_tokens, get_token_bars, get_holders, SOLANA_NETWORK_ID
 from indicators import compute_all_indicators, generate_trade_management_signals
 from trader.config import (
     CODEX_BAR_COUNTBACK, CODEX_RESOLUTION,
@@ -170,6 +170,54 @@ def check_entry_conditions(signals):
     return True, "pass"
 
 
+# === Safety Check (anti-scam) ===
+
+# Cache to avoid re-checking the same token every tick
+_safety_cache = {}  # address → (is_safe, reason, timestamp)
+SAFETY_CACHE_TTL = 3600  # re-check every hour
+
+MAX_TOP10_PERCENT = 50.0   # reject if top10 holders own > 50%
+MIN_HOLDERS_SAFETY = 100   # reject if < 100 holders
+MIN_LIQUIDITY = 5000       # reject if liquidity < $5K
+
+
+def check_token_safety(address):
+    """Check if a token is safe to trade (not a scam/rug).
+
+    Uses Codex holders endpoint for top10 concentration and holder count.
+    Results are cached for SAFETY_CACHE_TTL seconds.
+    """
+    import time as _time
+
+    # Check cache
+    if address in _safety_cache:
+        is_safe, reason, ts = _safety_cache[address]
+        if _time.time() - ts < SAFETY_CACHE_TTL:
+            return is_safe, reason
+
+    try:
+        holders_data = get_holders(address, limit=1)
+    except Exception as e:
+        log.debug(f"Safety check failed for {address[:8]}: {e}")
+        return True, "check_failed"  # allow if can't check
+
+    count = holders_data.get("count", 0)
+    top10_pct = holders_data.get("top10HoldersPercent", 0) or 0
+
+    if count < MIN_HOLDERS_SAFETY:
+        reason = f"holders={count}<{MIN_HOLDERS_SAFETY}"
+        _safety_cache[address] = (False, reason, _time.time())
+        return False, reason
+
+    if top10_pct > MAX_TOP10_PERCENT:
+        reason = f"top10={top10_pct:.1f}%>{MAX_TOP10_PERCENT}%"
+        _safety_cache[address] = (False, reason, _time.time())
+        return False, reason
+
+    _safety_cache[address] = (True, "safe", _time.time())
+    return True, "safe"
+
+
 _meta_model = None
 
 
@@ -227,6 +275,12 @@ def scan_token(address, symbol):
 
     if not entry_pass:
         log.debug(f"SCAN {symbol:12s} | SKIP ({reason})")
+        return signals, False, None
+
+    # Safety check (anti-scam): only run on tokens that pass entry conditions
+    is_safe, safety_reason = check_token_safety(address)
+    if not is_safe:
+        log.info(f"BLOCKED SCAM: {symbol} | {safety_reason}")
         return signals, False, None
 
     # Meta-model filter
