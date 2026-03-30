@@ -84,6 +84,19 @@ def fetch_token_data(address):
     return df
 
 
+def _sanitize(val):
+    """Convert numpy types to Python native for JSON serialization."""
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        return float(val)
+    if isinstance(val, (np.bool_,)):
+        return bool(val)
+    if isinstance(val, float) and np.isnan(val):
+        return None
+    return val
+
+
 def compute_signals(df):
     """Compute all indicators and return the latest row's signal values."""
     df = compute_all_indicators(df)
@@ -95,30 +108,30 @@ def compute_signals(df):
     latest = df.iloc[-1]
 
     signals = {
-        "roc_30m": latest.get("roc_30m", np.nan),
-        "roc_1h": latest.get("roc_1h", np.nan),
-        "roc_accel_30m": latest.get("roc_accel_30m", np.nan),
-        "roc_accel_1h": latest.get("roc_accel_1h", np.nan),
-        "rvol": latest.get("rvol", np.nan),
-        "ofi_30m": latest.get("ofi_30m", np.nan),
-        "ofi_1h": latest.get("ofi_1h", np.nan),
-        "fisher": latest.get("fisher", np.nan),
-        "fisher_signal": latest.get("fisher_signal", np.nan),
-        "fisher_cross": latest.get("fisher_cross", np.nan),
-        "ebsw": latest.get("ebsw", np.nan),
-        "above_itrend": latest.get("above_itrend", np.nan),
-        "hurst": latest.get("hurst", np.nan),
-        "macd_hist": latest.get("macd_hist", np.nan),
-        "macd_hist_slope": latest.get("macd_hist_slope", np.nan),
-        "bs_ratio": latest.get("bs_ratio", np.nan),
-        "buyer_seller_ratio": latest.get("buyer_seller_ratio", np.nan),
-        "momentum_quality": latest.get("momentum_quality", np.nan),
+        "roc_30m": _sanitize(latest.get("roc_30m", np.nan)),
+        "roc_1h": _sanitize(latest.get("roc_1h", np.nan)),
+        "roc_accel_30m": _sanitize(latest.get("roc_accel_30m", np.nan)),
+        "roc_accel_1h": _sanitize(latest.get("roc_accel_1h", np.nan)),
+        "rvol": _sanitize(latest.get("rvol", np.nan)),
+        "ofi_30m": _sanitize(latest.get("ofi_30m", np.nan)),
+        "ofi_1h": _sanitize(latest.get("ofi_1h", np.nan)),
+        "fisher": _sanitize(latest.get("fisher", np.nan)),
+        "fisher_signal": _sanitize(latest.get("fisher_signal", np.nan)),
+        "fisher_cross": _sanitize(latest.get("fisher_cross", np.nan)),
+        "ebsw": _sanitize(latest.get("ebsw", np.nan)),
+        "above_itrend": _sanitize(latest.get("above_itrend", np.nan)),
+        "hurst": _sanitize(latest.get("hurst", np.nan)),
+        "macd_hist": _sanitize(latest.get("macd_hist", np.nan)),
+        "macd_hist_slope": _sanitize(latest.get("macd_hist_slope", np.nan)),
+        "bs_ratio": _sanitize(latest.get("bs_ratio", np.nan)),
+        "buyer_seller_ratio": _sanitize(latest.get("buyer_seller_ratio", np.nan)),
+        "momentum_quality": _sanitize(latest.get("momentum_quality", np.nan)),
         "tighten_stop": bool(latest.get("tighten_stop", False)),
-        "price": latest.get("close", latest.get("mcap", 0)),
-        "volume": latest.get("volume", 0),
-        "buy_volume": latest.get("buy_volume", 0),
-        "sell_volume": latest.get("sell_volume", 0),
-        "liquidity": latest.get("liquidity", 0),
+        "price": _sanitize(latest.get("close", latest.get("mcap", 0))),
+        "volume": _sanitize(latest.get("volume", 0)),
+        "buy_volume": _sanitize(latest.get("buy_volume", 0)),
+        "sell_volume": _sanitize(latest.get("sell_volume", 0)),
+        "liquidity": _sanitize(latest.get("liquidity", 0)),
     }
 
     return signals
