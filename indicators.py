@@ -1,5 +1,7 @@
 """Momentum quality indicators for 5-minute bar trading.
 
+Includes P3 (Hurst exponent) and P4 (ROC, MACD, RVOL, OFI) indicators.
+
 P4 indicators (computationally trivial, no training needed):
   - ROC (Rate of Change) at multiple timeframes
   - ROC acceleration (2nd derivative of price — momentum of momentum)
@@ -12,6 +14,77 @@ All indicators are computed online (streaming-compatible).
 
 import numpy as np
 import pandas as pd
+
+
+def compute_hurst(series, min_window=4, max_window=None):
+    """Compute the Hurst exponent using R/S analysis.
+
+    H > 0.5: trending (persistent) — good for momentum
+    H = 0.5: random walk — no edge
+    H < 0.5: mean-reverting — bad for momentum
+
+    Returns scalar Hurst exponent.
+    """
+    data = np.asarray(series, dtype=float)
+    n = len(data)
+    if n < 20:
+        return 0.5  # insufficient data
+
+    if max_window is None:
+        max_window = n // 2
+
+    windows = []
+    rs_values = []
+
+    window_size = min_window
+    while window_size <= max_window:
+        n_windows = n // window_size
+        if n_windows < 1:
+            break
+
+        rs_list = []
+        for i in range(n_windows):
+            chunk = data[i * window_size:(i + 1) * window_size]
+            mean = chunk.mean()
+            deviations = chunk - mean
+            cumdev = np.cumsum(deviations)
+            R = cumdev.max() - cumdev.min()
+            S = chunk.std(ddof=1)
+            if S > 0:
+                rs_list.append(R / S)
+
+        if rs_list:
+            windows.append(window_size)
+            rs_values.append(np.mean(rs_list))
+
+        window_size = int(window_size * 1.5)
+        if window_size == int(window_size / 1.5):
+            window_size += 1
+
+    if len(windows) < 3:
+        return 0.5
+
+    log_w = np.log(windows)
+    log_rs = np.log(rs_values)
+    hurst, _ = np.polyfit(log_w, log_rs, 1)
+
+    return float(np.clip(hurst, 0, 1))
+
+
+def compute_rolling_hurst(series, window=48):
+    """Compute rolling Hurst exponent over a window.
+
+    window=48 = 4 hours of 5-min bars.
+    """
+    result = pd.Series(0.5, index=series.index)
+    values = series.values
+
+    for i in range(window, len(values)):
+        chunk = values[i - window:i]
+        if np.std(chunk) > 0:
+            result.iloc[i] = compute_hurst(chunk)
+
+    return result
 
 
 def compute_roc(series, period):
@@ -98,6 +171,9 @@ def compute_all_indicators(df):
 
     # Relative volume
     result["rvol"] = compute_rvol(volume)
+
+    # Hurst exponent (P3 — trend strength for position sizing)
+    result["hurst"] = compute_rolling_hurst(mcap, window=48)
 
     # Buy/sell indicators (Codex data only)
     if "buy_volume" in result.columns and result["buy_volume"].sum() > 0:
