@@ -168,7 +168,8 @@ class HMMStrategy:
                  exit_threshold=0.3,
                  stop_loss=15.0,
                  min_mcap=200_000,
-                 min_age=3):
+                 min_age=3,
+                 grace_period=2):
         """
         Args:
             model: trained GaussianHMM
@@ -178,6 +179,7 @@ class HMMStrategy:
             stop_loss: trailing stop loss %
             min_mcap: minimum mcap to consider entry
             min_age: minimum hours from 50K before entry
+            grace_period: minimum hours to hold before trailing stop activates
         """
         self.model = model
         self.growth_state = growth_state
@@ -186,6 +188,7 @@ class HMMStrategy:
         self.stop_loss = stop_loss
         self.min_mcap = min_mcap
         self.min_age = min_age
+        self.grace_period = grace_period
 
     def generate_signals(self, trajectory):
         """Run HMM on a trajectory and generate entry/exit signals."""
@@ -249,25 +252,37 @@ class HMMStrategy:
                 # Exit conditions
                 should_exit = False
                 reason = None
+                hours_held = row["hour"] - df.iloc[entry_idx]["hour"]
 
-                # 1. HMM says regime changed to decay
-                if row["growth_prob"] < self.exit_threshold:
-                    should_exit = True
-                    reason = "regime_change"
+                # Grace period: only hard stop during initial hours
+                if hours_held < self.grace_period:
+                    # Only hard stop during grace period (catastrophic protection)
+                    if entry_mcap > 0:
+                        pnl = (current_mcap / entry_mcap - 1) * 100
+                        if pnl < -self.stop_loss * 2:
+                            should_exit = True
+                            reason = "hard_stop"
+                else:
+                    # After grace period: full exit logic
 
-                # 2. Trailing stop
-                if peak_mcap > 0:
-                    drawdown = (1 - current_mcap / peak_mcap) * 100
-                    if drawdown > self.stop_loss:
+                    # 1. HMM says regime changed to decay
+                    if row["growth_prob"] < self.exit_threshold:
                         should_exit = True
-                        reason = "trailing_stop"
+                        reason = "regime_change"
 
-                # 3. Hard stop (2x stop_loss from entry)
-                if entry_mcap > 0:
-                    pnl = (current_mcap / entry_mcap - 1) * 100
-                    if pnl < -self.stop_loss * 2:
-                        should_exit = True
-                        reason = "hard_stop"
+                    # 2. Trailing stop
+                    if peak_mcap > 0:
+                        drawdown = (1 - current_mcap / peak_mcap) * 100
+                        if drawdown > self.stop_loss:
+                            should_exit = True
+                            reason = "trailing_stop"
+
+                    # 3. Hard stop (2x stop_loss from entry)
+                    if entry_mcap > 0:
+                        pnl = (current_mcap / entry_mcap - 1) * 100
+                        if pnl < -self.stop_loss * 2:
+                            should_exit = True
+                            reason = "hard_stop"
 
                 if should_exit:
                     ret = (current_mcap / entry_mcap - 1) * 100 if entry_mcap > 0 else 0
@@ -438,22 +453,25 @@ def cmd_sweep(args):
         return
 
     configs = [
-        {"entry_threshold": 0.6, "exit_threshold": 0.4, "stop_loss": 15, "min_mcap": 200000, "min_age": 3},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 200000, "min_age": 3},
-        {"entry_threshold": 0.8, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 200000, "min_age": 3},
-        {"entry_threshold": 0.7, "exit_threshold": 0.4, "stop_loss": 15, "min_mcap": 200000, "min_age": 3},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 10, "min_mcap": 200000, "min_age": 3},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 20, "min_mcap": 200000, "min_age": 3},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 500000, "min_age": 3},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 200000, "min_age": 1},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 200000, "min_age": 5},
-        # Tighter thresholds
-        {"entry_threshold": 0.8, "exit_threshold": 0.4, "stop_loss": 15, "min_mcap": 200000, "min_age": 3},
-        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 200000, "min_age": 3},
-        # Very early entry
-        {"entry_threshold": 0.6, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 1},
-        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 1},
+        # Baseline (no grace period)
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3, "grace_period": 0},
+        # Grace period variations
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3, "grace_period": 2},
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3, "grace_period": 3},
+        {"entry_threshold": 0.8, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3, "grace_period": 2},
+        {"entry_threshold": 0.8, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3, "grace_period": 3},
+        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3, "grace_period": 2},
+        {"entry_threshold": 0.7, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 3, "grace_period": 3},
+        # Higher entry + grace + varying stop loss
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 10, "min_mcap": 100000, "min_age": 3, "grace_period": 2},
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 20, "min_mcap": 100000, "min_age": 3, "grace_period": 2},
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 25, "min_mcap": 100000, "min_age": 3, "grace_period": 2},
+        # Grace + varying mcap
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 200000, "min_age": 3, "grace_period": 2},
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 50000, "min_age": 3, "grace_period": 2},
+        # Very aggressive early entry
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 1, "grace_period": 2},
+        {"entry_threshold": 0.9, "exit_threshold": 0.3, "stop_loss": 15, "min_mcap": 100000, "min_age": 1, "grace_period": 3},
     ]
 
     print(f"\n{'='*110}")
