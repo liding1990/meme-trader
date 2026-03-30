@@ -1,2 +1,9 @@
 numpy
 pandas
+matplotlib
+torch
+ts2vec
+umap-learn
+hdbscan
+plotly
+kaleido
