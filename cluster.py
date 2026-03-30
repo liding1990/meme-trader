@@ -107,7 +107,7 @@ def main():
             line=dict(color=NOISE_COLOR, width=2),
             name=f"{symbol} (noise)",
             legendgroup="Noise",
-            showlegend=(idx == noise_idx[0]),
+            showlegend=bool(idx == noise_idx[0]),
             legendgrouptitle_text="Noise" if idx == noise_idx[0] else None,
             hovertext=[f"{symbol}<br>Step {s}/{n_steps}" for s in range(1, n_steps + 1)],
             hoverinfo="text",
@@ -130,7 +130,7 @@ def main():
                 line=dict(color=color, width=3),
                 name=f"{symbol}",
                 legendgroup=f"Cluster {cluster_id}",
-                showlegend=(j == 0),
+                showlegend=bool(j == 0),
                 legendgrouptitle_text=f"Cluster {cluster_id} ({len(cluster_idx)})" if j == 0 else None,
                 hovertext=[
                     f"{symbol}<br>ATH: ${ath:,.0f}<br>Rally: {duration}h<br>Step {s}/{n_steps}"
