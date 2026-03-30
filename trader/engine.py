@@ -171,12 +171,14 @@ def run():
                 if should_exit:
                     executor.close_position(address, reason, exit_signals=signals)
 
-                    # Persist remaining positions
-                    for addr, p in executor.positions.items():
-                        db.save_position(
-                            addr, p.symbol, "", p.entry_price,
-                            p.position_size, p.peak_price, p.bars_held, p.trade_id,
-                        )
+                # Persist position state to DB (for dashboard + crash recovery)
+                if address in executor.positions:
+                    p = executor.positions[address]
+                    db.save_position(
+                        p.token_address, p.symbol, "",
+                        p.entry_price, p.position_size,
+                        p.peak_price, p.bars_held, p.trade_id,
+                    )
 
             # === Phase 4: Open new positions ===
             for candidate in entry_candidates:
