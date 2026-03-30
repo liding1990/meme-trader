@@ -153,6 +153,10 @@ def main():
 
     print_results(results, K)
 
+    # Visualize
+    from visualize import plot_prediction
+    html_path = plot_prediction(raw, args.address[:8], results, K)
+
     return results, K, raw
 
 
