@@ -210,7 +210,7 @@ def build_html():
             entry_time = p["entry_time"][:19] if p["entry_time"] else ""
             positions_html += f"""
             <tr>
-                <td><strong>{p['symbol']}</strong></td>
+                <td><a href="https://gmgn.ai/sol/token/{p['token_address']}" target="_blank" style="color:#58a6ff;text-decoration:none"><strong>{p['symbol']}</strong></a></td>
                 <td>{entry_time}</td>
                 <td>${p['entry_price']:.8f}</td>
                 <td>${p['position_size']:.0f}</td>
@@ -236,7 +236,7 @@ def build_html():
         signals = json.loads(t["entry_signals"]) if t["entry_signals"] else {}
         trades_html += f"""
         <tr>
-            <td><strong>{t['symbol']}</strong></td>
+            <td><a href="https://gmgn.ai/sol/token/{t['token_address']}" target="_blank" style="color:#58a6ff;text-decoration:none"><strong>{t['symbol']}</strong></a></td>
             <td>{entry_time}</td>
             <td>{exit_time}</td>
             <td>${t['entry_price']:.8f}</td>
