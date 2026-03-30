@@ -38,7 +38,9 @@ class Strategy5m:
                  roc_entry_threshold=3.0,
                  rvol_entry_threshold=1.5,
                  hazard_exit_threshold=0.15,
-                 grace_period=6):
+                 grace_period=6,
+                 require_multi_bar_confirmation=True,
+                 dynamic_hazard=True):
         """
         Args:
             stop_loss: default trailing stop %
@@ -49,6 +51,8 @@ class Strategy5m:
             rvol_entry_threshold: RVOL must exceed this to enter
             hazard_exit_threshold: exit when P(pump dies next bar) exceeds this
             grace_period: bars to hold before trailing stop activates
+            require_multi_bar_confirmation: require 2+ consecutive positive bars before entry
+            dynamic_hazard: relax hazard threshold when in profit, tighten when losing
         """
         self.stop_loss = stop_loss
         self.tight_stop_loss = tight_stop_loss
@@ -58,6 +62,8 @@ class Strategy5m:
         self.rvol_entry_threshold = rvol_entry_threshold
         self.hazard_exit_threshold = hazard_exit_threshold
         self.grace_period = grace_period
+        self.require_multi_bar_confirmation = require_multi_bar_confirmation
+        self.dynamic_hazard = dynamic_hazard
 
     def simulate(self, df, kmf=None):
         """Run strategy on a 5-min DataFrame with indicators.
@@ -92,9 +98,17 @@ class Strategy5m:
                     continue
 
                 # Entry: positive ROC + above-average volume + acceleration
-                if (roc > self.roc_entry_threshold and
-                        rvol > self.rvol_entry_threshold and
-                        roc_accel > 0):
+                entry_ok = (roc > self.roc_entry_threshold and
+                            rvol > self.rvol_entry_threshold and
+                            roc_accel > 0)
+
+                # Multi-bar confirmation: previous bar also had positive ROC
+                if entry_ok and self.require_multi_bar_confirmation and idx >= 1:
+                    prev_roc = df.iloc[idx - 1].get("roc_30m", 0)
+                    if pd.isna(prev_roc) or prev_roc <= 0:
+                        entry_ok = False
+
+                if entry_ok:
                     in_trade = True
                     entry_idx = idx
                     peak_mcap = mcap
@@ -113,9 +127,24 @@ class Strategy5m:
                 reason = None
 
                 # 1. Survival hazard: P(pump dies) too high
+                # Dynamic: relax threshold when profitable, tighten when losing
                 if kmf is not None and bars_held >= 3:
                     hazard = compute_hazard_rate(kmf, bars_held)
-                    if hazard > self.hazard_exit_threshold:
+                    pnl_pct = (mcap / entry_mcap - 1) * 100 if entry_mcap > 0 else 0
+
+                    if self.dynamic_hazard:
+                        if pnl_pct > 5:
+                            # In profit >5%: relax hazard (let it run)
+                            effective_threshold = self.hazard_exit_threshold * 1.5
+                        elif pnl_pct < -3:
+                            # Losing >3%: tighten hazard (get out faster)
+                            effective_threshold = self.hazard_exit_threshold * 0.7
+                        else:
+                            effective_threshold = self.hazard_exit_threshold
+                    else:
+                        effective_threshold = self.hazard_exit_threshold
+
+                    if hazard > effective_threshold:
                         should_exit = True
                         reason = "hazard"
 
@@ -325,27 +354,27 @@ def cmd_sweep(args):
         kmf = None
 
     configs = [
-        # Baseline without survival
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 1.0, "grace_period": 6, "min_mcap": 100000},
-        # With survival exit
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000},
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.20, "grace_period": 6, "min_mcap": 100000},
-        # Vary ROC threshold
-        {"roc_entry_threshold": 5.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        {"roc_entry_threshold": 8.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        # Vary RVOL threshold
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 2.0, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 3.0, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        # Vary stop loss
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 10, "tight_stop_loss": 5, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 20, "tight_stop_loss": 10, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        # Vary grace period
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 3, "min_mcap": 100000},
-        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 12, "min_mcap": 100000},
-        # Best combo candidates
-        {"roc_entry_threshold": 5.0, "rvol_entry_threshold": 2.0, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000},
-        {"roc_entry_threshold": 5.0, "rvol_entry_threshold": 2.0, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.12, "grace_period": 6, "min_mcap": 50000},
+        # === BASELINE (previous best) ===
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": False, "dynamic_hazard": False},
+        # === Multi-bar confirmation (filter false entries) ===
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": False},
+        # === Dynamic hazard (let winners run) ===
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": False, "dynamic_hazard": True},
+        # === Both improvements ===
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        # === Both + varying hazard threshold ===
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.08, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.12, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.15, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        # === Both + varying entry thresholds ===
+        {"roc_entry_threshold": 5.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 2.0, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        # === Both + mcap variations ===
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 50000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 15, "tight_stop_loss": 8, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 200000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        # === Both + stop loss variations ===
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 10, "tight_stop_loss": 5, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
+        {"roc_entry_threshold": 3.0, "rvol_entry_threshold": 1.5, "stop_loss": 20, "tight_stop_loss": 10, "hazard_exit_threshold": 0.10, "grace_period": 6, "min_mcap": 100000, "require_multi_bar_confirmation": True, "dynamic_hazard": True},
     ]
 
     print(f"\n{'='*120}")
