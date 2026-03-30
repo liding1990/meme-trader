@@ -28,9 +28,9 @@ _COMMON_PARAMS = {
 }
 
 
-def _build_endpoints(chain, address):
-    """Build the two endpoints needed for DNA fingerprinting."""
-    return [
+def _build_endpoints(chain, address, resolution="1h"):
+    """Build the endpoints needed for data fetching."""
+    endpoints = [
         {
             "name": "token_trends",
             "path": f"/api/v1/token_trends/{chain}/{address}",
@@ -39,9 +39,17 @@ def _build_endpoints(chain, address):
         {
             "name": "token_mcap_candles",
             "path": f"/api/v1/token_mcap_candles/{chain}/{address}",
-            "params": {"resolution": "1h", "limit": "400", "pool_type": "unified"},
+            "params": {"resolution": resolution, "limit": "400", "pool_type": "unified"},
         },
     ]
+    # Add 5m candles if primary resolution is 1h (fetch both)
+    if resolution == "1h":
+        endpoints.append({
+            "name": "token_mcap_candles_5m",
+            "path": f"/api/v1/token_mcap_candles/{chain}/{address}",
+            "params": {"resolution": "5m", "limit": "400", "pool_type": "unified"},
+        })
+    return endpoints
 
 
 def _build_url(endpoint):
@@ -65,13 +73,14 @@ def _curl_get(url):
     return result.stdout
 
 
-def fetch_token_data(chain, address):
+def fetch_token_data(chain, address, resolution="1h"):
     """Fetch trend and candle data for a token.
 
     Returns (data_dir, loaded_data) where loaded_data is a dict:
         {
             "token_trends": {...},
             "token_mcap_candles": {...},
+            "token_mcap_candles_5m": {...},  # if resolution="1h"
         }
     """
     if not os.path.isfile(_CURL_BIN):
@@ -80,7 +89,7 @@ def fetch_token_data(chain, address):
     out_dir = os.path.join("data", address)
     os.makedirs(out_dir, exist_ok=True)
 
-    endpoints = _build_endpoints(chain, address)
+    endpoints = _build_endpoints(chain, address, resolution=resolution)
     timestamp = int(time.time() * 1000)
 
     loaded_data = {}
