@@ -23,6 +23,10 @@ Raw 4D Time Series → TS2Vec (encoding) → UMAP (3D projection) → HDBSCAN (c
 - **UMAP**: Non-linear dimensionality reduction preserving local cluster structure
 - **HDBSCAN**: Density-based clustering that auto-discovers cluster count and identifies noise/outliers
 
+## Development Machine
+
+MacBook Pro M4, 48GB RAM. Use MPS (Metal Performance Shaders) as PyTorch device when available.
+
 ## Python Environment
 
 **MUST use `venv` to manage the Python environment.**

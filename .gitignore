@@ -6,3 +6,4 @@ data/
 models/
 plots/
 .claude/
+.env
