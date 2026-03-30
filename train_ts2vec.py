@@ -2,7 +2,8 @@
 
 Reads:  data/dataset.npy — shape (N, 200, 4)
 Writes: models/ts2vec.pkl — trained model checkpoint
-        data/embeddings.npy — shape (N, 320)
+        data/embeddings.npy — shape (N, 320) instance-level
+        data/trajectory_embeddings.npy — shape (N, 200, 320) timestamp-level
 """
 
 import os
@@ -52,15 +53,21 @@ def main():
     model.save(model_path)
     print(f"Model saved: {model_path}")
 
-    # Encode
-    print("Encoding embeddings...")
+    # Encode — instance-level (for point-based clustering)
+    print("Encoding instance-level embeddings...")
     embeddings = model.encode(data, encoding_window="full_series")
-    print(f"Embeddings shape: {embeddings.shape}")
-
-    # Save embeddings
+    print(f"Instance embeddings shape: {embeddings.shape}")
     emb_path = os.path.join(DATA_DIR, "embeddings.npy")
     np.save(emb_path, embeddings)
-    print(f"Embeddings saved: {emb_path}")
+    print(f"Instance embeddings saved: {emb_path}")
+
+    # Encode — timestamp-level (for trajectory visualization)
+    print("Encoding timestamp-level embeddings...")
+    traj_embeddings = model.encode(data)
+    print(f"Trajectory embeddings shape: {traj_embeddings.shape}")
+    traj_path = os.path.join(DATA_DIR, "trajectory_embeddings.npy")
+    np.save(traj_path, traj_embeddings)
+    print(f"Trajectory embeddings saved: {traj_path}")
 
 
 if __name__ == "__main__":
