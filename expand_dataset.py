@@ -46,21 +46,17 @@ def discover_tokens():
 
     print(f"Existing tokens: {len(existing)}")
 
-    # Define queries to explore
-    queries = [
-        {"orderby": "marketcap", "direction": "desc", "time_window": "1h", "limit": 100},
-        {"orderby": "marketcap", "direction": "desc", "time_window": "6h", "limit": 100},
-        {"orderby": "marketcap", "direction": "desc", "time_window": "24h", "limit": 100},
-        {"orderby": "volume", "direction": "desc", "time_window": "1h", "limit": 100},
-        {"orderby": "volume", "direction": "desc", "time_window": "6h", "limit": 100},
-        {"orderby": "volume", "direction": "desc", "time_window": "24h", "limit": 100},
-        {"orderby": "swaps", "direction": "desc", "time_window": "1h", "limit": 100},
-        {"orderby": "swaps", "direction": "desc", "time_window": "6h", "limit": 100},
-        {"orderby": "swaps", "direction": "desc", "time_window": "24h", "limit": 100},
-        {"orderby": "change", "direction": "desc", "time_window": "1h", "limit": 100},
-        {"orderby": "change", "direction": "desc", "time_window": "6h", "limit": 100},
-        {"orderby": "change", "direction": "desc", "time_window": "24h", "limit": 100},
-    ]
+    # Define queries — include BOTH ascending and descending to capture
+    # dead/failed tokens (not just winners). This reduces survivorship bias.
+    orderby_options = ["marketcap", "volume", "swaps", "change"]
+    time_windows = ["1h", "6h", "24h"]
+    queries = []
+    for ob in orderby_options:
+        for tw in time_windows:
+            # Top performers (desc)
+            queries.append({"orderby": ob, "direction": "desc", "time_window": tw, "limit": 100})
+            # Worst performers / dead tokens (asc) — reduces survivorship bias
+            queries.append({"orderby": ob, "direction": "asc", "time_window": tw, "limit": 100})
 
     new_tokens = {}  # address → {symbol, name}
 
