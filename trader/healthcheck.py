@@ -117,12 +117,96 @@ def check_database():
     }
 
 
+def check_trades_detail():
+    """Detailed per-trade retrospective analysis."""
+    if not os.path.isfile(DB_PATH):
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    # All closed trades
+    cur = conn.execute("""
+        SELECT symbol, token_address, entry_time, exit_time,
+               entry_price, exit_price, return_pct, pnl_usd,
+               bars_held, exit_reason, entry_signals, exit_signals
+        FROM trades WHERE exit_time IS NOT NULL
+        ORDER BY exit_time DESC
+    """)
+    trades = [dict(row) for row in cur.fetchall()]
+
+    # Open positions
+    cur = conn.execute("""
+        SELECT t.symbol, t.token_address, t.entry_time, t.entry_price,
+               t.entry_signals, p.peak_price, p.bars_held
+        FROM trades t JOIN positions p ON t.token_address = p.token_address
+        WHERE t.exit_time IS NULL
+    """)
+    positions = [dict(row) for row in cur.fetchall()]
+
+    conn.close()
+    return trades, positions
+
+
+def analyze_trade(trade):
+    """Analyze a single closed trade — identify what went right/wrong."""
+    import json
+    issues = []
+    notes = []
+
+    ret = trade["return_pct"] or 0
+    reason = trade["exit_reason"] or ""
+    bars = trade["bars_held"] or 0
+    symbol = trade["symbol"]
+    address = trade["token_address"]
+
+    entry_signals = {}
+    if trade["entry_signals"]:
+        try:
+            entry_signals = json.loads(trade["entry_signals"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    exit_signals = {}
+    if trade["exit_signals"]:
+        try:
+            exit_signals = json.loads(trade["exit_signals"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Flag potential scam tokens
+    ofi = entry_signals.get("ofi_30m", 0)
+    rvol = entry_signals.get("rvol", 0)
+    ebsw = entry_signals.get("ebsw", 0)
+    fisher = entry_signals.get("fisher", 0)
+    liquidity = entry_signals.get("liquidity", 0)
+
+    if ret < -20:
+        issues.append(f"LARGE LOSS ({ret:+.1f}%)")
+    if reason == "hard_stop":
+        issues.append("HIT HARD STOP — possible rug/crash")
+    if liquidity and liquidity < 10000:
+        issues.append(f"LOW LIQUIDITY (${liquidity:,.0f})")
+    if ofi and ofi < 0.05:
+        issues.append(f"WEAK OFI at entry ({ofi:.2f}) — borderline buy pressure")
+
+    if ret > 10:
+        notes.append(f"GOOD TRADE (+{ret:.1f}%)")
+    if reason == "tight_stop" and ret > 0:
+        notes.append("Tight stop captured profit correctly")
+    if reason == "hazard" and ret > 0:
+        notes.append("Survival model exited profitably")
+    if bars <= 2 and ret < -5:
+        issues.append(f"QUICK REVERSAL — signal may be false breakout (bars={bars})")
+
+    return issues, notes
+
+
 def check_logs():
     """Check recent log entries."""
     if not os.path.isfile(LOG_PATH):
         return {"error": "Log not found"}
 
-    # Get last 5 lines
     result = subprocess.run(
         ["tail", "-5", LOG_PATH],
         capture_output=True, text=True,
@@ -168,6 +252,57 @@ def run_check():
 
         if db["recent_errors"] > 0:
             print(f"\n  WARNING: {db['recent_errors']} errors in the last hour")
+
+    # Trade-by-trade retrospective
+    try:
+        trades_detail, positions_detail = check_trades_detail()
+
+        if positions_detail:
+            print(f"{'─'*70}")
+            print(f"  Open Positions ({len(positions_detail)}):")
+            import json
+            for p in positions_detail:
+                entry_sigs = {}
+                if p["entry_signals"]:
+                    try:
+                        entry_sigs = json.loads(p["entry_signals"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                ofi = entry_sigs.get("ofi_30m", "?")
+                ebsw = entry_sigs.get("ebsw", "?")
+                print(f"    {p['symbol']:12s} entry=${p['entry_price']:.8f} bars={p['bars_held']} "
+                      f"peak=${p['peak_price']:.8f} OFI={ofi} EBSW={ebsw}")
+
+        if trades_detail:
+            print(f"{'─'*70}")
+            print(f"  Trade Retrospective (last 10):")
+            for t in trades_detail[:10]:
+                ret = t["return_pct"] or 0
+                pnl = t["pnl_usd"] or 0
+                marker = "WIN" if ret > 0 else "LOSS"
+                issues, notes = analyze_trade(t)
+
+                print(f"    [{marker:4s}] {t['symbol']:12s} {ret:+6.1f}% (${pnl:+.2f}) "
+                      f"bars={t['bars_held'] or 0} exit={t['exit_reason'] or '?'}")
+
+                for issue in issues:
+                    print(f"           FLAG: {issue}")
+                for note in notes:
+                    print(f"           NOTE: {note}")
+
+            # Aggregated flags
+            all_issues = []
+            for t in trades_detail:
+                issues, _ = analyze_trade(t)
+                all_issues.extend(issues)
+            if all_issues:
+                from collections import Counter
+                print(f"\n  Issue Summary:")
+                for issue, count in Counter(all_issues).most_common(5):
+                    print(f"    {count}x {issue}")
+
+    except Exception as e:
+        print(f"  Trade analysis error: {e}")
 
     # Last log lines
     logs = check_logs()
