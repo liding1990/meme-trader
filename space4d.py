@@ -33,6 +33,19 @@ MCAP_THRESHOLD = 50_000
 DNA_COLUMNS = ["mcap", "holder_count", "top10_pct"]
 
 
+def _log_transform(points):
+    """Log-transform mcap (col 1) and holders (col 2) for distance computation.
+
+    These dimensions span multiple orders of magnitude — without log,
+    $553K and $181K look identical on a 0-$218M scale.
+    Time (col 0) and top10% (col 3) keep linear scale.
+    """
+    out = points.copy()
+    out[:, 1] = np.log1p(out[:, 1])  # mcap: log(1 + mcap)
+    out[:, 2] = np.log1p(out[:, 2])  # holders: log(1 + holders)
+    return out
+
+
 def load_token_list():
     tokens = []
     with open("token_list.csv", "r") as f:
@@ -118,10 +131,12 @@ def build_state_space():
     print(f"  Top10% range:  {all_points[:, 3].min():.1f}% — {all_points[:, 3].max():.1f}%")
 
     # Build KD-tree for fast nearest neighbor lookup
-    # Normalize dimensions for distance computation (different scales)
-    scales = all_points.max(axis=0) - all_points.min(axis=0)
+    # Log-transform mcap and holders (span multiple orders of magnitude)
+    # top10% is already on a reasonable scale, time is linear
+    normalized = _log_transform(all_points)
+    scales = normalized.max(axis=0) - normalized.min(axis=0)
     scales[scales == 0] = 1
-    normalized = all_points / scales
+    normalized = normalized / scales
 
     tree = cKDTree(normalized)
 
@@ -189,14 +204,14 @@ def query_token(address, space, top_n=5, chain="sol"):
     print(f"  Holders: {current_state[2]:,.0f}")
     print(f"  Top10%:  {current_state[3]:.1f}%")
 
-    # Find nearest neighbors in normalized space
+    # Find nearest neighbors in log-transformed + normalized space
     points = space["points"]
     scales = space["scales"]
     meta = space["meta"]
     token_trajs = space["token_trajs"]
 
-    normalized_points = points / scales
-    normalized_query = current_state / scales
+    normalized_points = _log_transform(points) / scales
+    normalized_query = _log_transform(current_state.reshape(1, -1)).flatten() / scales
 
     tree = cKDTree(normalized_points)
 
