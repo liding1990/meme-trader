@@ -73,6 +73,67 @@ def _curl_get(url):
     return result.stdout
 
 
+def fetch_full_candles(chain, address, resolution="1h", max_pages=10):
+    """Fetch ALL historical candles by paginating backwards with the 'to' parameter.
+
+    Returns list of candle dicts sorted by time ascending, deduplicated.
+    """
+    if not os.path.isfile(_CURL_BIN):
+        raise FileNotFoundError(f"curl-impersonate not found at {_CURL_BIN}")
+
+    all_candles = []
+    to_ts = None
+
+    for page in range(max_pages):
+        params = {"resolution": resolution, "limit": "400", "pool_type": "unified"}
+        if to_ts:
+            params["to"] = str(to_ts)
+
+        endpoint = {
+            "path": f"/api/v1/token_mcap_candles/{chain}/{address}",
+            "params": params,
+        }
+        url = _build_url(endpoint)
+
+        try:
+            body = _curl_get(url)
+            if body.startswith("<!DOCTYPE") or "Cloudflare" in body:
+                break
+            parsed = json.loads(body)
+            candles = parsed.get("data", {}).get("list", [])
+        except Exception:
+            break
+
+        if not candles:
+            break
+
+        prev_len = len(all_candles)
+        all_candles.extend(candles)
+
+        # Next page: earliest timestamp as 'to'
+        earliest = min(int(c["time"]) for c in candles)
+        if to_ts is not None and earliest >= to_ts:
+            break  # no progress, stop
+        to_ts = earliest
+
+        if len(candles) < 400:
+            break  # last page
+
+        time.sleep(1)
+
+    # Deduplicate by timestamp, sort ascending
+    seen = set()
+    unique = []
+    for c in all_candles:
+        t = int(c["time"])
+        if t not in seen:
+            seen.add(t)
+            unique.append(c)
+    unique.sort(key=lambda c: int(c["time"]))
+
+    return unique
+
+
 def fetch_token_data(chain, address, resolution="1h"):
     """Fetch trend and candle data for a token.
 

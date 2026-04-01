@@ -66,9 +66,50 @@ def load_from_cache(address: str):
     return mcap_data, trend_data
 
 
-def build_trajectory(mcap_data: dict, trend_data: dict):
-    """Build hourly trajectory starting from first hour mcap >= 50K, capped at 3 months."""
-    if not mcap_data or not trend_data:
+def _load_moralis_holders(address: str):
+    """Load Moralis hourly holder data if available. Returns DataFrame or None."""
+    moralis_path = os.path.join(DATA_DIR, address, "moralis_holders_1h.json")
+    if not os.path.isfile(moralis_path):
+        return None
+    try:
+        with open(moralis_path) as f:
+            data = json.load(f)
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        df["datetime"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
+        df["holders"] = df["totalHolders"].astype(float)
+        df = df[["datetime", "holders"]].sort_values("datetime").reset_index(drop=True)
+        df = df[df["holders"] > 0]  # filter out zero-holder entries
+        return df if len(df) >= 2 else None
+    except Exception:
+        return None
+
+
+def _load_gmgn_holders(trend_data: dict):
+    """Load GMGN trend holder data (daily granularity fallback). Returns DataFrame or None."""
+    trend_section = trend_data.get("data") if trend_data else None
+    if not trend_section:
+        return None
+    trends = trend_section.get("trends", {})
+    holder_series = trends.get("holder_count", [])
+    if not holder_series:
+        return None
+    df = pd.DataFrame(holder_series)
+    df["datetime"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
+    df["holders"] = df["value"].astype(float)
+    df = df[["datetime", "holders"]].sort_values("datetime")
+    df = df.set_index("datetime").resample("1h").last().dropna().reset_index()
+    return df if len(df) >= 2 else None
+
+
+def build_trajectory(mcap_data: dict, trend_data: dict, address: str = None):
+    """Build hourly trajectory starting from first hour mcap >= 50K, capped at 3 months.
+
+    Uses Moralis hourly holders when available (true hourly granularity),
+    falls back to GMGN trends (daily granularity) otherwise.
+    """
+    if not mcap_data:
         return None
     data_section = mcap_data.get("data")
     if not data_section:
@@ -83,19 +124,14 @@ def build_trajectory(mcap_data: dict, trend_data: dict):
     mcap_df["volume"] = mcap_df["volume"].astype(float)
     mcap_df = mcap_df[["datetime", "mcap", "volume"]].sort_values("datetime").reset_index(drop=True)
 
-    trend_section = trend_data.get("data")
-    if not trend_section:
+    # Prefer Moralis hourly holders, fall back to GMGN trends
+    holder_df = None
+    if address:
+        holder_df = _load_moralis_holders(address)
+    if holder_df is None:
+        holder_df = _load_gmgn_holders(trend_data)
+    if holder_df is None:
         return None
-    trends = trend_section.get("trends", {})
-    holder_series = trends.get("holder_count", [])
-    if not holder_series:
-        return None
-
-    holder_df = pd.DataFrame(holder_series)
-    holder_df["datetime"] = pd.to_datetime(holder_df["timestamp"].astype(int), unit="s")
-    holder_df["holders"] = holder_df["value"].astype(float)
-    holder_df = holder_df[["datetime", "holders"]].sort_values("datetime")
-    holder_df = holder_df.set_index("datetime").resample("1h").last().dropna().reset_index()
 
     mcap_df["datetime"] = mcap_df["datetime"].dt.floor("h")
     mcap_df = mcap_df.groupby("datetime", as_index=False).last()
@@ -107,7 +143,8 @@ def build_trajectory(mcap_data: dict, trend_data: dict):
         merged = pd.merge(mcap_df, holder_df, on="datetime", how="outer").sort_values("datetime")
         merged["mcap"] = merged["mcap"].ffill()
         merged["holders"] = merged["holders"].ffill()
-        merged = merged.dropna()
+        merged["volume"] = merged["volume"].ffill().fillna(0)
+        merged = merged.dropna(subset=["mcap", "holders"])
 
     if merged.empty:
         return None
@@ -145,10 +182,10 @@ def load_all_trajectories():
 
     for addr in radar_addrs:
         mcap_data, trend_data = load_from_cache(addr)
-        if mcap_data is None or trend_data is None:
+        if mcap_data is None:
             skipped += 1
             continue
-        df = build_trajectory(mcap_data, trend_data)
+        df = build_trajectory(mcap_data, trend_data, address=addr)
         if df is not None and len(df) >= 2:
             trajectories[addr] = df
             token_meta[addr] = meta[addr]
@@ -393,7 +430,7 @@ def fetch_and_build_trajectory(address: str, chain: str = "sol"):
     mcap_data = loaded_data.get("token_mcap_candles", {})
     trend_data = loaded_data.get("token_trends", {})
 
-    return build_trajectory(mcap_data, trend_data)
+    return build_trajectory(mcap_data, trend_data, address=address)
 
 
 def classify_token(new_df: pd.DataFrame, trajectories: dict, cluster_addrs: dict):
