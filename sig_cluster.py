@@ -148,10 +148,11 @@ def plot_cluster_patterns(labels, meta_df):
 
     # Create one figure with subplots: rows = clusters, cols = 4 dims
     n_clusters = len(unique_clusters)
+    max_v_spacing = 1.0 / max(n_clusters - 1, 1) - 0.01
     fig = make_subplots(
         rows=n_clusters, cols=4,
         subplot_titles=[f"C{c} — {dim}" for c in unique_clusters for dim in DNA_LABELS],
-        vertical_spacing=0.08,
+        vertical_spacing=min(0.08, max_v_spacing),
         horizontal_spacing=0.05,
     )
 
