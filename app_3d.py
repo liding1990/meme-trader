@@ -80,7 +80,7 @@ def _load_moralis_holders(address: str):
         df["datetime"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
         df["holders"] = df["totalHolders"].astype(float)
         df = df[["datetime", "holders"]].sort_values("datetime").reset_index(drop=True)
-        df = df[df["holders"] > 0]  # filter out zero-holder entries
+        df = df[df["holders"] > 0]
         return df if len(df) >= 2 else None
     except Exception:
         return None
@@ -460,9 +460,29 @@ def classify_token(new_df: pd.DataFrame, trajectories: dict, cluster_addrs: dict
     return best_cid, cluster_distances
 
 
+def _compute_roc(df: pd.DataFrame, window: int = 6) -> pd.DataFrame:
+    """Compute rolling rate-of-change for mcap and holders.
+
+    Returns DataFrame with hours, mcap_roc (% change per window), holders_roc (absolute change per window).
+    """
+    roc = df[["hours"]].copy()
+    # MCap: percentage change over rolling window
+    roc["mcap_roc"] = df["mcap"].pct_change(periods=window).fillna(0) * 100
+    # Holders: absolute change over rolling window
+    roc["holders_roc"] = df["holders"].diff(periods=window).fillna(0)
+    # Clip extreme values for better visualization
+    roc["mcap_roc"] = roc["mcap_roc"].clip(-100, 500)
+    roc["holders_roc"] = roc["holders_roc"].clip(-1000, 5000)
+    # Keep raw values for hover
+    roc["mcap"] = df["mcap"]
+    roc["holders"] = df["holders"]
+    return roc
+
+
 def build_figure(trajectories: dict, token_meta: dict, cluster_map: dict, visible_clusters: set,
-                 cluster_grades: dict = None, query_token: tuple = None):
+                 cluster_grades: dict = None, query_token: tuple = None, view_mode: str = "absolute"):
     fig = go.Figure()
+    is_roc = view_mode == "rate_of_change"
 
     for addr, df in trajectories.items():
         cid = cluster_map.get(addr, -1)
@@ -487,13 +507,26 @@ def build_figure(trajectories: dict, token_meta: dict, cluster_map: dict, visibl
         name = meta.get("name", "Unknown")
         symbol = meta.get("symbol", addr[:8])
 
-        fig.add_trace(go.Scatter3d(
-            x=df["hours"],
-            y=df["mcap"],
-            z=df["holders"],
-            mode="lines",
-            line=dict(color=color, width=width),
-            text=[
+        if is_roc:
+            roc = _compute_roc(df)
+            x_vals, y_vals, z_vals = roc["hours"], roc["mcap_roc"], roc["holders_roc"]
+            hover_texts = [
+                f"<b>{symbol}</b> ({name})<br>"
+                f"Grade {cluster_grades[cid]['grade']} {GRADE_LABELS[cluster_grades[cid]['grade']]}<br>"
+                f"T+{row['hours']:.0f}h<br>"
+                f"MCap RoC: {row['mcap_roc']:+.1f}%/6h<br>"
+                f"Holder RoC: {row['holders_roc']:+.0f}/6h<br>"
+                f"MCap: ${row['mcap']:,.0f} | Holders: {row['holders']:,.0f}"
+                if cluster_grades and cid in cluster_grades else
+                f"<b>{symbol}</b> ({name})<br>"
+                f"T+{row['hours']:.0f}h<br>"
+                f"MCap RoC: {row['mcap_roc']:+.1f}%/6h<br>"
+                f"Holder RoC: {row['holders_roc']:+.0f}/6h"
+                for _, row in roc.iterrows()
+            ]
+        else:
+            x_vals, y_vals, z_vals = df["hours"], df["mcap"], df["holders"]
+            hover_texts = [
                 f"<b>{symbol}</b> ({name})<br>"
                 f"Grade {cluster_grades[cid]['grade']} {GRADE_LABELS[cluster_grades[cid]['grade']]}<br>"
                 f"T+{row['hours']:.0f}h<br>"
@@ -505,7 +538,13 @@ def build_figure(trajectories: dict, token_meta: dict, cluster_map: dict, visibl
                 f"MCap: ${row['mcap']:,.0f}<br>"
                 f"Holders: {row['holders']:,.0f}"
                 for _, row in df.iterrows()
-            ],
+            ]
+
+        fig.add_trace(go.Scatter3d(
+            x=x_vals, y=y_vals, z=z_vals,
+            mode="lines",
+            line=dict(color=color, width=width),
+            text=hover_texts,
             hoverinfo="text",
             name=symbol,
             showlegend=False,
@@ -515,55 +554,66 @@ def build_figure(trajectories: dict, token_meta: dict, cluster_map: dict, visibl
     if query_token is not None:
         q_df, q_symbol, q_cid = query_token
         cluster_color = CLUSTER_COLORS[q_cid % len(CLUSTER_COLORS)] if q_cid >= 0 else OUTLIER_COLOR
-        fig.add_trace(go.Scatter3d(
-            x=q_df["hours"],
-            y=q_df["mcap"],
-            z=q_df["holders"],
-            mode="lines+markers",
-            line=dict(color=QUERY_TOKEN_COLOR, width=6),
-            marker=dict(size=3, color=QUERY_TOKEN_COLOR),
-            text=[
+
+        if is_roc:
+            q_roc = _compute_roc(q_df)
+            qx, qy, qz = q_roc["hours"], q_roc["mcap_roc"], q_roc["holders_roc"]
+            q_hover = [
+                f"<b>★ {q_symbol}</b> (QUERY)<br>"
+                f"→ Cluster {q_cid}<br>"
+                f"T+{row['hours']:.0f}h<br>"
+                f"MCap RoC: {row['mcap_roc']:+.1f}%/6h<br>"
+                f"Holder RoC: {row['holders_roc']:+.0f}/6h"
+                for _, row in q_roc.iterrows()
+            ]
+        else:
+            qx, qy, qz = q_df["hours"], q_df["mcap"], q_df["holders"]
+            q_hover = [
                 f"<b>★ {q_symbol}</b> (QUERY)<br>"
                 f"→ Cluster {q_cid}<br>"
                 f"T+{row['hours']:.0f}h<br>"
                 f"MCap: ${row['mcap']:,.0f}<br>"
                 f"Holders: {row['holders']:,.0f}"
                 for _, row in q_df.iterrows()
-            ],
+            ]
+
+        fig.add_trace(go.Scatter3d(
+            x=qx, y=qy, z=qz,
+            mode="lines+markers",
+            line=dict(color=QUERY_TOKEN_COLOR, width=6),
+            marker=dict(size=3, color=QUERY_TOKEN_COLOR),
+            text=q_hover,
             hoverinfo="text",
             name=f"★ {q_symbol} (query)",
             showlegend=True,
         ))
-        # Start marker
         fig.add_trace(go.Scatter3d(
-            x=[q_df["hours"].iloc[0]],
-            y=[q_df["mcap"].iloc[0]],
-            z=[q_df["holders"].iloc[0]],
-            mode="markers",
-            marker=dict(size=8, color=cluster_color, symbol="diamond"),
-            showlegend=False,
-            hovertext=f"{q_symbol} START",
-            hoverinfo="text",
+            x=[qx.iloc[0]], y=[qy.iloc[0]], z=[qz.iloc[0]],
+            mode="markers", marker=dict(size=8, color=cluster_color, symbol="diamond"),
+            showlegend=False, hovertext=f"{q_symbol} START", hoverinfo="text",
         ))
-        # End marker (current)
         fig.add_trace(go.Scatter3d(
-            x=[q_df["hours"].iloc[-1]],
-            y=[q_df["mcap"].iloc[-1]],
-            z=[q_df["holders"].iloc[-1]],
-            mode="markers",
-            marker=dict(size=10, color=cluster_color, symbol="diamond"),
-            showlegend=False,
-            hovertext=f"{q_symbol} NOW",
-            hoverinfo="text",
+            x=[qx.iloc[-1]], y=[qy.iloc[-1]], z=[qz.iloc[-1]],
+            mode="markers", marker=dict(size=10, color=cluster_color, symbol="diamond"),
+            showlegend=False, hovertext=f"{q_symbol} NOW", hoverinfo="text",
         ))
 
     n_visible = sum(1 for a in trajectories if cluster_map.get(a, -1) in visible_clusters)
-    fig.update_layout(
-        title=dict(
-            text=f"Radar Token Trajectories ({n_visible} visible) — Origin: first MCap > $50K",
-            font=dict(size=16, color="black"),
-        ),
-        scene=dict(
+
+    if is_roc:
+        title_text = f"Rate of Change View ({n_visible} visible) — 6h rolling window"
+        scene = dict(
+            xaxis_title="Time (hours since MCap > $50K)",
+            yaxis_title="MCap Change (%/6h)",
+            zaxis_title="Holder Change (/6h)",
+            xaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+            yaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+            zaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+            bgcolor="white",
+        )
+    else:
+        title_text = f"Radar Token Trajectories ({n_visible} visible) — Origin: first MCap > $50K"
+        scene = dict(
             xaxis_title="Time (hours since MCap > $50K)",
             yaxis_title="Market Cap ($)",
             zaxis_title="Holders",
@@ -571,7 +621,11 @@ def build_figure(trajectories: dict, token_meta: dict, cluster_map: dict, visibl
             yaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)", type="log"),
             zaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)"),
             bgcolor="white",
-        ),
+        )
+
+    fig.update_layout(
+        title=dict(text=title_text, font=dict(size=16, color="black")),
+        scene=scene,
         paper_bgcolor="white",
         plot_bgcolor="white",
         font=dict(color="black"),
@@ -641,6 +695,16 @@ with st.sidebar:
 
         if st.checkbox(label, value=default, key=f"c_{cid}"):
             visible.add(cid)
+
+# View mode toggle
+st.sidebar.divider()
+view_mode = st.sidebar.radio(
+    "View Mode",
+    ["Absolute (MCap × Holders)", "Rate of Change (RoC)"],
+    index=0,
+    key="view_mode",
+)
+view_mode_key = "rate_of_change" if "Rate" in view_mode else "absolute"
 
 # ── Token Query Section ──────────────────────────────────────────────────────
 st.sidebar.divider()
@@ -724,7 +788,8 @@ if query_address:
 
 # Main area: 3D chart + cluster descriptions
 fig = build_figure(trajectories, token_meta, cluster_map, visible,
-                   cluster_grades=cluster_grades, query_token=query_token_result)
+                   cluster_grades=cluster_grades, query_token=query_token_result,
+                   view_mode=view_mode_key)
 st.plotly_chart(fig, width="stretch")
 
 # Cluster description panel
