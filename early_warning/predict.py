@@ -177,6 +177,12 @@ def train_model(force=False):
     with open(os.path.join("early_warning", "thresholds.json"), "w") as f:
         json.dump(thresholds, f, indent=2)
 
+    # Save training data for nearest-neighbor lookups at inference
+    train_data = df[["address", "symbol", "t_start", "t_end", "future_max_mult", "label"]
+                     + all_feature_cols].copy()
+    train_data["pred_mult"] = train_pred.tolist()
+    train_data.to_parquet(os.path.join("early_warning", "train_data.parquet"), index=False)
+
     print(f"Models saved ({len(df)} samples, {len(base_cols)}+{len(all_feature_cols)} features)", file=sys.stderr)
     return model_base.booster_, model_hist.booster_, base_cols, all_feature_cols
 
@@ -233,6 +239,144 @@ def compute_grade(pred_mult: float, thresholds: dict) -> dict:
         "color": color,
         "desc": desc,
     }
+
+
+# ── Similar Windows & Attribution ────────────────────────────────────────────
+
+
+def find_similar_windows(feat: dict, hist_cols: list, n=8) -> list[dict]:
+    """Find training windows most similar to the input features.
+
+    Uses Euclidean distance in standardized feature space.
+    Returns list of {symbol, t_start, t_end, actual_mult, distance}.
+    """
+    train_path = os.path.join("early_warning", "train_data.parquet")
+    if not os.path.isfile(train_path):
+        return []
+
+    df = pd.read_parquet(train_path)
+    feature_cols = [c for c in hist_cols if c in df.columns]
+    if not feature_cols:
+        return []
+
+    X_train = df[feature_cols].values.astype(float)
+    X_train = np.nan_to_num(X_train, nan=0)
+
+    # Standardize
+    mean = X_train.mean(axis=0)
+    std = X_train.std(axis=0)
+    std[std < 1e-9] = 1
+    X_norm = (X_train - mean) / std
+
+    # Input vector
+    vec = np.array([feat.get(c, 0) for c in feature_cols], dtype=float)
+    vec = np.nan_to_num(vec, nan=0)
+    vec_norm = (vec - mean) / std
+
+    # Euclidean distances
+    dists = np.sqrt(((X_norm - vec_norm) ** 2).sum(axis=1))
+
+    # Top N nearest, deduplicate by token (keep closest per token)
+    order = np.argsort(dists)
+    results = []
+    seen_tokens = set()
+    for idx in order:
+        row = df.iloc[idx]
+        token_key = row["symbol"]
+        if token_key in seen_tokens:
+            continue
+        seen_tokens.add(token_key)
+        results.append({
+            "symbol": row["symbol"],
+            "address": row["address"],
+            "t_start": row["t_start"][:16],
+            "t_end": row["t_end"][:16],
+            "actual_mult": row["future_max_mult"],
+            "label": row["label"],
+            "distance": round(float(dists[idx]), 2),
+        })
+        if len(results) >= n:
+            break
+
+    return results
+
+
+def compute_attribution(feat: dict, base_cols: list, model) -> list[dict]:
+    """Compute feature attribution using model's feature importance + feature values.
+
+    Returns list of {feature, value, direction, importance} sorted by |contribution|.
+    """
+    # Get feature importance from model
+    importance = model.feature_importance(importance_type="gain")
+    imp_dict = dict(zip(base_cols, importance))
+
+    # Load training stats for context (what's "high" vs "low")
+    train_path = os.path.join("early_warning", "train_data.parquet")
+    if os.path.isfile(train_path):
+        df = pd.read_parquet(train_path)
+        medians = {c: df[c].median() for c in base_cols if c in df.columns}
+    else:
+        medians = {}
+
+    attrs = []
+    for col in base_cols:
+        val = feat.get(col, 0)
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            continue
+        imp = imp_dict.get(col, 0)
+        med = medians.get(col, 0)
+
+        # Direction: is this feature value bullish or bearish relative to median?
+        if med != 0:
+            deviation = (val - med) / abs(med)
+        else:
+            deviation = 0
+
+        attrs.append({
+            "feature": col,
+            "value": val,
+            "median": med,
+            "deviation": deviation,
+            "importance": imp,
+            "contribution": abs(deviation) * imp,
+        })
+
+    attrs.sort(key=lambda x: x["contribution"], reverse=True)
+    return attrs
+
+
+FEATURE_DESCRIPTIONS = {
+    "mcap_start": "MCap at window start",
+    "mcap_end": "MCap at window end",
+    "mcap_max": "MCap peak in 24h",
+    "mcap_min": "MCap trough in 24h",
+    "mcap_return": "24h price return",
+    "mcap_range": "Price range (high-low)",
+    "return_6h": "First 6h return",
+    "return_12h": "First 12h return",
+    "volatility": "Hourly volatility",
+    "mean_return": "Average hourly return",
+    "max_drawdown": "Max drawdown",
+    "momentum_shift": "Late vs early momentum",
+    "peak_position": "Where peak occurs (0=start, 1=end)",
+    "volume_total": "Total 24h volume",
+    "volume_mean": "Average hourly volume",
+    "volume_trend": "Volume increasing or decreasing",
+    "volume_concentration": "Volume concentration in single hour",
+    "holders_start": "Holders at window start",
+    "holders_end": "Holders at window end",
+    "holder_growth": "Holder growth rate",
+    "mcap_per_holder": "MCap per holder",
+    "mcap_holder_corr": "MCap-holder correlation",
+    "top10_pct": "Top 10 holder concentration",
+    "top10_change": "Top 10 concentration change",
+    "hist_ath": "Historical ATH",
+    "hist_ath_ratio": "Current vs historical ATH",
+    "token_age_hours": "Token age",
+    "hist_return_total": "Historical total return",
+    "hist_volatility": "Historical volatility",
+    "hist_pump_count": "Past 2x pump count",
+}
 
 
 # ── Inference ────────────────────────────────────────────────────────────────
@@ -345,6 +489,15 @@ def predict_token(address: str, chain: str = "sol"):
     else:
         rank_pct = 80
 
+    # Find similar historical windows
+    similar = find_similar_windows(feat, hist_cols, n=8)
+    similar_mults = [s["actual_mult"] for s in similar]
+    similar_median = float(np.median(similar_mults)) if similar_mults else 0
+    similar_pump_rate = sum(1 for m in similar_mults if m >= 2.0) / max(len(similar_mults), 1)
+
+    # Feature attribution
+    attribution = compute_attribution(feat, base_cols, model_base)
+
     return {
         "address": address,
         "chain": chain,
@@ -353,7 +506,11 @@ def predict_token(address: str, chain: str = "sol"):
             "predicted_max_multiple": round(pred_mult, 2),
             "horizon": f"{PREDICT_HOURS}h",
             "rank_percentile": f"top {rank_pct}%",
+            "similar_median_mult": round(similar_median, 2),
+            "similar_pump_rate": round(similar_pump_rate * 100, 1),
         },
+        "similar_windows": similar,
+        "attribution": attribution[:8],  # top 8 contributing features
         "current_state": {
             "mcap": feat.get("mcap_end", 0),
             "mcap_24h_return": feat.get("mcap_return", 0),
@@ -411,6 +568,9 @@ def print_report(result: dict):
     print(f"  {g['desc']}")
     print(f"  Predicted 48h max multiple: {bold}{p['predicted_max_multiple']}x{reset}")
     print(f"  Ranking: {p['rank_percentile']}")
+    if p.get("similar_median_mult"):
+        print(f"  Similar tokens median outcome: {bold}{p['similar_median_mult']}x{reset}")
+        print(f"  Similar tokens pump rate (2x+): {p['similar_pump_rate']}%")
 
     print(f"\n{bold}Current State (last 24h):{reset}")
     print(f"  MCap:           ${s['mcap']:>14,.0f}")
@@ -445,6 +605,58 @@ def print_report(result: dict):
         print(f"  Transactions:   {codex['total_transactions']:>14,.0f}")
         print(f"  Buy Pressure:   {codex['buy_pressure_pct']*100:>13.1f}%")
         print(f"  NV Trend:       {codex['net_volume_trend']:>+14.2f}")
+
+    # Attribution: why this grade?
+    attrs = result.get("attribution", [])
+    if attrs:
+        print(f"\n{bold}Key Factors:{reset}")
+        for a in attrs[:6]:
+            name = FEATURE_DESCRIPTIONS.get(a["feature"], a["feature"])
+            val = a["value"]
+            med = a["median"]
+            dev = a["deviation"]
+
+            if isinstance(val, float) and abs(val) >= 1000:
+                val_str = f"${val:,.0f}"
+                med_str = f"${med:,.0f}"
+            elif isinstance(val, float) and abs(val) < 1:
+                val_str = f"{val:.3f}"
+                med_str = f"{med:.3f}"
+            else:
+                val_str = f"{val:,.1f}"
+                med_str = f"{med:,.1f}"
+
+            if dev > 0.5:
+                arrow = "\033[92m▲ HIGH\033[0m"
+            elif dev > 0.1:
+                arrow = "\033[92m▲ above avg\033[0m"
+            elif dev < -0.5:
+                arrow = "\033[91m▼ LOW\033[0m"
+            elif dev < -0.1:
+                arrow = "\033[91m▼ below avg\033[0m"
+            else:
+                arrow = "  ≈ average"
+
+            print(f"  {name:.<35s} {val_str:>12s} (avg: {med_str:>10s}) {arrow}")
+
+    # Similar historical windows
+    similar = result.get("similar_windows", [])
+    if similar:
+        print(f"\n{bold}Similar Historical Tokens:{reset}")
+        print(f"  {'Token':>12s}  {'Period':>16s}  {'Outcome':>8s}  {'Label':>5s}  {'Dist':>5s}")
+        print(f"  {'-'*52}")
+        for s in similar:
+            mult_str = f"{s['actual_mult']:.1f}x"
+            label_color = "\033[92m" if s["label"] == "pump" else "\033[91m" if s["label"] == "dump" else ""
+            label_reset = "\033[0m" if label_color else ""
+            print(f"  {s['symbol']:>12s}  {s['t_end']:>16s}  {mult_str:>8s}  "
+                  f"{label_color}{s['label']:>5s}{label_reset}  {s['distance']:>5.1f}")
+
+        mults = [s["actual_mult"] for s in similar]
+        n_pump = sum(1 for m in mults if m >= 2.0)
+        print(f"\n  Median outcome: {bold}{np.median(mults):.2f}x{reset}")
+        print(f"  Pump rate: {n_pump}/{len(mults)} ({n_pump/len(mults)*100:.0f}%)")
+        print(f"  Range: {min(mults):.1f}x — {max(mults):.1f}x")
 
     print(f"\n{bold}Data Quality:{reset}")
     print(f"  Candles: {q['candle_count']}, Range: {q['time_range']}")
