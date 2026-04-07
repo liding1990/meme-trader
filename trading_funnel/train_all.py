@@ -27,6 +27,10 @@ DATA_DIR = "data"
 RADAR_CSV = os.path.join(DATA_DIR, "radar_tokens.csv")
 OUTPUT_DIR = "trading_funnel"
 
+# Execution friction
+SLIPPAGE_PCT = 0.03        # 3% slippage on sells
+RUG_THRESHOLD = -0.50      # if price drops 50%+ in 1 tick, assume rug (can't exit)
+
 # L0 thresholds
 MCAP_MIN = 100_000
 HOLDER_MIN = 100
@@ -190,7 +194,7 @@ def l1_filter(mcap, holders, top10, tick_idx):
 # ── L2: Entry Model ─────────────────────────────────────────────────────────
 
 
-def build_l2_dataset(tokens):
+def build_l2_dataset(tokens, verbose=True):
     """Build L2 training data: for each L0 window, compute features + entry label."""
     from trading_funnel.features import (extract_features_at_tick, FEATURE_NAMES,
                                           precompute_hmm_for_token, apply_hmm_to_features)
@@ -210,8 +214,6 @@ def build_l2_dataset(tokens):
             continue
 
         n_tokens += 1
-
-        # Precompute HMM once for this token
         hmm_s, hmm_d, hmm_t = precompute_hmm_for_token(mcap)
 
         for tick in l0_ticks:
@@ -237,10 +239,11 @@ def build_l2_dataset(tokens):
                 **feat,
             })
 
-        if (i + 1) % 50 == 0:
+        if verbose and (i + 1) % 50 == 0:
             print(f"  L2: {i+1}/{len(tokens)}, {len(samples)} 样本, {n_tokens} token")
 
-    print(f"L2 数据集: {len(samples)} 个样本, {n_tokens} 个 token")
+    if verbose:
+        print(f"L2 数据集: {len(samples)} 个样本, {n_tokens} 个 token")
     return pd.DataFrame(samples)
 
 
@@ -264,21 +267,32 @@ def compute_l3_label(mcap, tick, entry_price, remaining):
     near_drawdown = (future_min - current) / max(current, 1)
     long_return = (full_future.max() - current) / max(current, 1) if len(full_future) > 0 else future_return
 
-    # Local peak detection
+    # Local peak: current > next 3 bars
     is_peak = (tick + 3 < n and
                current >= mcap[tick+1] and current >= mcap[tick+2] and current >= mcap[tick+3])
 
-    # TP at local peaks
+    # === HARD STOP: -35% = always EXIT ===
+    if pnl < -0.35:
+        return "EXIT"
+
+    # === TAKE PROFIT ===
+    # At local peaks with significant gains
     if is_peak and pnl > 0:
         if pnl > 1.5 and long_return < 0.20:
             return "TP_100" if remaining <= 0.5 else "TP_50"
-        if pnl > 0.5 and near_drawdown < -0.20:
+        if pnl > 0.8 and near_drawdown < -0.15:
             return "TP_50" if remaining > 0.5 else "TP_25"
-        if pnl > 0.2 and near_drawdown < -0.15:
+        if pnl > 0.3 and near_drawdown < -0.15:
             return "TP_25"
 
-    # SL when clearly dying
-    if pnl < -0.30 and long_return < 0.10:
+    # Not at peak but huge gains and about to crash
+    if pnl > 1.0 and near_drawdown < -0.25:
+        return "TP_50" if remaining > 0.5 else "TP_100"
+    if pnl > 0.5 and near_drawdown < -0.30 and long_return < 0.30:
+        return "TP_25"
+
+    # === STOP LOSS ===
+    if pnl < -0.25 and long_return < 0.10:
         return "EXIT"
     if pnl < -0.20 and long_return < 0.05:
         return "SL_50" if remaining > 0.5 else "EXIT"
@@ -399,6 +413,16 @@ def backtest_e2e(tokens, l2_model, l3_model, l2_features, l3_features):
                 peak = max(peak, mcap[t])
                 pnl = (mcap[t] - entry_price) / max(entry_price, 1)
 
+                # Rug detection: if price drops 50%+ in 1 tick, can't exit
+                if t > tick:
+                    tick_change = (mcap[t] - mcap[t-1]) / max(mcap[t-1], 1)
+                    if tick_change < RUG_THRESHOLD:
+                        # Rug pull — remaining position is lost
+                        realized += remaining * pnl  # whatever it's worth (near 0)
+                        remaining = 0
+                        exit_tick = t
+                        break
+
                 l3_feat = extract_features_at_tick(
                     mcap, volume, holders, top10, t,
                     entry_price=entry_price, holding_hours=t - tick,
@@ -409,13 +433,24 @@ def backtest_e2e(tokens, l2_model, l3_model, l2_features, l3_features):
                 l3_vec = np.nan_to_num(l3_vec, nan=0)
                 l3_pred = str(l3_model.predict(l3_vec).flatten()[0])
 
+                # Hard stop loss override
+                if pnl < -0.35:
+                    l3_pred = "EXIT"
+
+                # Hard take profit nudge
+                if pnl > 1.0 and l3_pred == "HOLD" and remaining > 0.25:
+                    l3_pred = "TP_25"
+
                 sell = min(ACTION_SELL.get(l3_pred, 0), remaining)
                 if sell > 0:
-                    realized += sell * pnl
+                    # Apply slippage on sells
+                    realized_pnl = pnl * (1 - SLIPPAGE_PCT)
+                    realized += sell * realized_pnl
                     remaining -= sell
 
             if remaining > 0.01:
                 final_pnl = (mcap[min(exit_tick, n-1)] - entry_price) / max(entry_price, 1)
+                final_pnl = final_pnl * (1 - SLIPPAGE_PCT)  # slippage on forced exit
                 realized += remaining * final_pnl
 
             all_trades.append({
@@ -566,15 +601,58 @@ def main():
         json.dump({"l2_features": l2_features, "l3_features": l3_features}, f)
     print(f"\n模型已保存到 {OUTPUT_DIR}/")
 
-    # ── Step 5: End-to-End Backtest ──
+    # ── Step 5: End-to-End Backtest (true OOS via GroupKFold) ──
     print(f"\n{'='*60}")
-    print("Step 5: 端到端回测")
+    print("Step 5: 端到端回测 (GroupKFold OOS — 测试 token 从未参与训练)")
     print("=" * 60)
 
-    trades = backtest_e2e(tokens, l2_final, l3_final, l2_features, l3_features)
+    # Split tokens into 5 folds. For each fold, train L2+L3 on train tokens,
+    # backtest on held-out tokens.
+    unique_addrs = list(set(t["address"] for t in tokens if load_token_data(t["address"]) is not None))
+    np.random.seed(42)
+    np.random.shuffle(unique_addrs)
+    fold_size = len(unique_addrs) // 5
+    folds = [set(unique_addrs[i*fold_size:(i+1)*fold_size]) for i in range(5)]
+    folds[-1].update(unique_addrs[5*fold_size:])  # remainder in last fold
+
+    trades = []
+    for fold_idx, test_addrs in enumerate(folds):
+        train_addrs = set(unique_addrs) - test_addrs
+        train_tokens = [t for t in tokens if t["address"] in train_addrs]
+        test_tokens = [t for t in tokens if t["address"] in test_addrs]
+
+        # Train L2 on train tokens
+        l2_train_df = build_l2_dataset(train_tokens, verbose=False)
+        if len(l2_train_df) < 50:
+            continue
+        X2_train = l2_train_df[l2_features].values.astype(float)
+        X2_train = np.nan_to_num(X2_train, nan=0)
+        y2_train = l2_train_df["label"].values
+
+        l2_fold = CatBoostClassifier(iterations=300, depth=5, learning_rate=0.05,
+                                      auto_class_weights="Balanced", random_seed=42, verbose=0)
+        l2_fold.fit(X2_train, y2_train)
+
+        # Train L3 on train tokens
+        l2_entries_train = l2_train_df[l2_train_df["label"] == 1]
+        l3_train_df = build_l3_dataset(train_tokens, l2_entries_train)
+        if len(l3_train_df) < 50:
+            continue
+        X3_train = l3_train_df[l3_features].values.astype(float)
+        X3_train = np.nan_to_num(X3_train, nan=0)
+        y3_train = l3_train_df["label"].values
+
+        l3_fold = CatBoostClassifier(iterations=300, depth=5, learning_rate=0.05,
+                                      auto_class_weights="Balanced", random_seed=42, verbose=0)
+        l3_fold.fit(X3_train, y3_train)
+
+        # Backtest on test tokens only
+        fold_trades = backtest_e2e(test_tokens, l2_fold, l3_fold, l2_features, l3_features)
+        trades.extend(fold_trades)
+        print(f"  Fold {fold_idx}: train={len(train_addrs)} tokens, test={len(test_addrs)} tokens, trades={len(fold_trades)}")
     print_metrics(trades, "完整漏斗 (L0→L1→L2→L3)")
 
-    # Baseline: L0 + L1 only, 48h time exit
+    # Baseline: L0 + L1 only, 48h time exit (with slippage + rug detection)
     baseline_trades = []
     for token in tokens:
         data = load_token_data(token["address"])
@@ -588,8 +666,19 @@ def main():
                 continue
             if not l1_filter(mcap, holders, top10, tick):
                 continue
+            # Check for rug during holding
             exit_t = min(tick + 48, n - 1)
-            ret = (mcap[exit_t] - mcap[tick]) / max(mcap[tick], 1)
+            rugged = False
+            for t in range(tick + 1, exit_t + 1):
+                tick_chg = (mcap[t] - mcap[t-1]) / max(mcap[t-1], 1)
+                if tick_chg < RUG_THRESHOLD:
+                    ret = (mcap[t] - mcap[tick]) / max(mcap[tick], 1)
+                    rugged = True
+                    exit_t = t
+                    break
+            if not rugged:
+                ret = (mcap[exit_t] - mcap[tick]) / max(mcap[tick], 1)
+                ret = ret * (1 - SLIPPAGE_PCT)  # slippage on exit
             baseline_trades.append({"symbol": token["symbol"], "return": ret,
                                      "hold_hours": exit_t - tick, "entry_tick": tick, "max_unrealized": 0})
             cooldown = tick + 12
