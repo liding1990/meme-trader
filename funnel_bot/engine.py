@@ -20,9 +20,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from catboost import CatBoostClassifier
 from codex_api import filter_tokens, CODEX_API_KEY
 from scalper.price import get_token_price
+from gmgn_api import fetch_full_candles
 from funnel_bot import db
 from funnel_bot.logger import FunnelLogger
-from trading_funnel.features import FEATURE_NAMES
+from trading_funnel.features import (
+    FEATURE_NAMES, compute_roc, compute_rolling_std, compute_vwap,
+    precompute_hmm_for_token, extract_features_at_tick, apply_hmm_to_features,
+)
 
 # ── Config ──
 
@@ -94,31 +98,71 @@ def l1_filter_token(token_data):
     return True, "passed"
 
 
+# ── Bar Cache (avoid re-fetching within same scan cycle) ──
+
+_bar_cache = {}  # {address: {"ts": timestamp, "mcap": array, "volume": array, "holders": array, "top10": array}}
+BAR_CACHE_TTL = 600  # 10 min
+
+
+def fetch_recent_bars(address):
+    """Fetch recent hourly candles from GMGN + compute arrays."""
+    now = time.time()
+    if address in _bar_cache and now - _bar_cache[address]["ts"] < BAR_CACHE_TTL:
+        return _bar_cache[address]
+
+    try:
+        candles = fetch_full_candles("sol", address, resolution="1h", max_pages=2)
+        if not candles or len(candles) < 2:
+            return None
+
+        import pandas as pd
+        df = pd.DataFrame(candles)
+        df["mcap"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        df = df.sort_values("time")
+
+        mcap = df["mcap"].values
+        volume = df["volume"].values
+
+        # HMM precompute
+        hmm_s, hmm_d, hmm_t = precompute_hmm_for_token(mcap)
+
+        result = {
+            "ts": now,
+            "mcap": mcap,
+            "volume": volume,
+            "holders": np.zeros(len(mcap)),  # no real-time holder data
+            "top10": np.full(len(mcap), np.nan),
+            "hmm_s": hmm_s,
+            "hmm_d": hmm_d,
+            "hmm_t": hmm_t,
+            "n": len(mcap),
+        }
+        _bar_cache[address] = result
+        return result
+    except Exception as e:
+        log.error(f"fetch_bars failed for {address[:12]}", e)
+        return None
+
+
 # ── L2: Entry Signal ──
 
 def l2_predict(address, symbol, l2_model, l2_features):
-    price_data = get_token_price(address)
-    if price_data is None:
+    bars = fetch_recent_bars(address)
+    if bars is None or bars["n"] < 2:
         log.l2_predict(address, symbol, 0, False)
         return False, 0, {}
 
-    mcap = price_data.get("market_cap", 0) or price_data.get("price", 0)
-    if mcap <= 0:
-        log.l2_predict(address, symbol, 0, False)
-        return False, 0, {}
+    mcap = bars["mcap"]
+    volume = bars["volume"]
+    holders = bars["holders"]
+    top10 = bars["top10"]
+    n = bars["n"]
+    tick = n - 1  # latest tick
 
-    feat = {f: 0 for f in FEATURE_NAMES}
-    feat["mcap_start"] = mcap
-    feat["mcap_end"] = mcap
-    feat["mcap_max"] = mcap
-    feat["mcap_min"] = mcap
-    feat["price_vs_vwap"] = 1.0
-
-    # Add price data features
-    buy_vol = price_data.get("buy_volume_5m", 0)
-    sell_vol = price_data.get("sell_volume_5m", 0)
-    if sell_vol > 0:
-        feat["volume_trend"] = (buy_vol - sell_vol) / sell_vol
+    # Extract full features from recent bar history
+    feat = extract_features_at_tick(mcap, volume, holders, top10, tick)
+    apply_hmm_to_features(feat, bars["hmm_s"], bars["hmm_d"], bars["hmm_t"], tick)
 
     vec = np.array([[feat.get(c, 0) for c in l2_features]])
     vec = np.nan_to_num(vec, nan=0)
@@ -143,14 +187,26 @@ def l3_predict(address, symbol, entry_price, current_price, remaining, peak_pric
                        remaining, 0)
         return "EXIT"
 
-    feat = {f: 0 for f in FEATURE_NAMES}
-    feat["unrealized_pnl"] = pnl
-    feat["holding_hours"] = bars_held
-    feat["sold_pct"] = 1.0 - remaining
-    feat["remaining_pct"] = remaining
-    feat["distance_from_peak"] = (peak_price - current_price) / max(peak_price, 1)
-    feat["mcap_end"] = current_price
-    feat["price_vs_vwap"] = 1.0
+    # Try to use real bar data for richer features
+    bars = fetch_recent_bars(address)
+    if bars is not None and bars["n"] >= 5:
+        tick = bars["n"] - 1
+        feat = extract_features_at_tick(
+            bars["mcap"], bars["volume"], bars["holders"], bars["top10"], tick,
+            entry_price=entry_price, holding_hours=bars_held,
+            sold_pct=1.0 - remaining, remaining_pct=remaining, peak_price=peak_price,
+        )
+        apply_hmm_to_features(feat, bars["hmm_s"], bars["hmm_d"], bars["hmm_t"], tick)
+    else:
+        # Fallback: minimal features
+        feat = {f: 0 for f in FEATURE_NAMES}
+        feat["unrealized_pnl"] = pnl
+        feat["holding_hours"] = bars_held
+        feat["sold_pct"] = 1.0 - remaining
+        feat["remaining_pct"] = remaining
+        feat["distance_from_peak"] = (peak_price - current_price) / max(peak_price, 1)
+        feat["mcap_end"] = current_price
+        feat["price_vs_vwap"] = 1.0
 
     vec = np.array([[feat.get(c, 0) for c in l3_features]])
     vec = np.nan_to_num(vec, nan=0)
@@ -224,6 +280,7 @@ def run():
                     holders = c.get("holders", 0)
 
                     should_enter, proba, _ = l2_predict(addr, sym, l2_model, l2_features)
+                    time.sleep(1.5)  # rate limit for GMGN bar fetching
 
                     db.upsert_watchlist(addr, sym, name, mcap, holders, "passed", round(proba, 3))
 
