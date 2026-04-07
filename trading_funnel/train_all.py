@@ -30,6 +30,7 @@ OUTPUT_DIR = "trading_funnel"
 # Execution friction
 SLIPPAGE_PCT = 0.03        # 3% slippage on sells
 RUG_THRESHOLD = -0.50      # if price drops 50%+ in 1 tick, assume rug (can't exit)
+L2_ENTRY_THRESHOLD = 0.60  # only enter when L2 confidence > 60%
 
 # L0 thresholds
 MCAP_MIN = 100_000
@@ -394,9 +395,10 @@ def backtest_e2e(tokens, l2_model, l3_model, l2_features, l3_features):
             apply_hmm_to_features(feat, hmm_s, hmm_d, hmm_t, tick)
             l2_vec = np.array([[feat.get(c, 0) for c in l2_features]])
             l2_vec = np.nan_to_num(l2_vec, nan=0)
-            l2_pred = int(l2_model.predict(l2_vec).flatten()[0])
 
-            if l2_pred != 1:
+            # Use probability threshold instead of argmax
+            l2_proba = l2_model.predict_proba(l2_vec)[0][1]
+            if l2_proba < L2_ENTRY_THRESHOLD:
                 continue
 
             entry_price = mcap[tick]
