@@ -1300,344 +1300,250 @@ def section_candidate_monitor(df):
 
 
 def section_position_management():
-    """持仓管理 — Momentum Model 驱动的动态仓位管理。"""
+    """持仓管理 — Lifecycle Strategy: Holder-based position management."""
     st.markdown("## 持仓管理")
-    st.markdown("基于 CatBoost Momentum Signal 驱动的动态仓位管理。模型预测未来 6h 收益率作为动量信号。")
+    st.markdown("""
+    **核心原则：用 Holder 健康度做止损决策，而非价格。**
 
-    # ── Model Performance ──
-    st.markdown("### Momentum Model 回测结果（OOS, 243 tokens）")
+    社区还在 = Token 还活着 = 继续持有。社区散了 = 周期结束 = 卖出。
+    """)
+
+    # ── Strategy Rules ──
+    st.markdown("### 策略规则")
+
+    rules_data = pd.DataFrame({
+        "信号": ["Holder 持续增长", "Holder 停滞 + 浮盈 >50%", "Holder 连续下降 6h",
+                 "Holder 下降 12h + 成交量萎缩", "Holder 下降 24h+", "峰值回撤 >70% + Holder 下降"],
+        "动作": ["HOLD（无论价格怎么波动）", "止盈 20%", "止盈 25%", "止盈 40%", "全部卖出", "全部卖出（rug 保护）"],
+        "逻辑": [
+            "59% 的 runner 上升途中回调 >40%，价格止损会误杀大部分 runner",
+            "社区不再扩张，先锁定部分利润",
+            "社区开始流失，趋势可能反转",
+            "社区流失 + 成交量萎缩 = 双重确认，大幅减仓",
+            "持续 24h 的流失 = 社区已散，周期结束",
+            "深度崩盘 + 社区离开 = rug pull 或彻底死亡",
+        ],
+    })
+    st.dataframe(rules_data, hide_index=True, use_container_width=True)
+
+    # ── Backtest Results ──
+    st.divider()
+    st.markdown("### 回测结果（248 tokens，完整生命周期）")
 
     col1, col2, col3 = st.columns(3)
     col1.markdown("""
-    **Momentum Model**
-    - 平均收益: **+450.6%**
-    - 中位收益: **+41.0%**
-    - 胜率: **58%**
-    - Profit Factor: **10.58**
-    - Sharpe: **3.09**
+    **Lifecycle Strategy**
+    - 平均收益: **+550%**
+    - 中位收益: **+54%**
+    - 胜率: **61%**
+    - 平均盈利: **+927%**
+    - 平均亏损: **-46%**
+    - Profit Factor: **32.15**
+    - Sharpe: **1.75**
     """)
     col2.markdown("""
-    **Fixed TP/SL（对比）**
-    - 平均收益: +24.3%
-    - 中位收益: -79.1%
-    - 胜率: 31%
-    - Profit Factor: 1.35
-    - Sharpe: 0.93
+    **Fixed TP/SL**
+    - 平均收益: +120%
+    - 中位收益: +19%
+    - 胜率: 62%
+    - 平均盈利: +213%
+    - 平均亏损: -34%
+    - Profit Factor: 10.36
+    - Sharpe: 4.60
     """)
     col3.markdown("""
-    **Buy & Hold（对比）**
-    - 平均收益: +196.1%
-    - 中位收益: -48.3%
-    - 胜率: 32%
-    - Profit Factor: 5.04
-    - Sharpe: 3.10
+    **Buy & Hold**
+    - 平均收益: +193%
+    - 中位收益: -46%
+    - 胜率: 33%
+    - 平均盈利: +718%
+    - 平均亏损: -71%
+    - Profit Factor: 5.10
+    - Sharpe: 3.09
     """)
 
     st.markdown("""
-    > **关键改进：** Momentum Model 的中位收益从 Fixed TP/SL 的 **-79%** 提升到 **+41%**，
-    > 胜率从 31% 提升到 58%。模型在健康回调时不止损（因为 holder/volume 动能仍正），
-    > 在动能衰减时主动止盈。
+    > **核心改进：** 中位收益从 Buy & Hold 的 **-46%** 提升到 **+54%**。
+    > 策略不在上升途中的回调止损（59% 的 runner 回调 >40%），
+    > 而是等到 holder 真正开始流失才卖出。
     """)
 
     st.divider()
 
-    # ── Strategy Logic ──
-    st.markdown("### 策略逻辑")
-    with st.expander("Momentum Signal 决策规则"):
-        st.markdown("""
-        模型每小时预测未来 6h 收益率作为 **momentum signal**，驱动仓位决策：
-
-        | Signal | 条件 | 动作 |
-        |---|---|---|
-        | **强看跌** | signal < -10% | EXIT（全部止损） |
-        | **看跌 + 亏损** | signal < -3% 且 浮亏 >10% | 减仓 50% |
-        | **动能衰减 + 有利润** | 浮盈 >30% 且 signal 从 >5% 降到 <2% | 止盈 25% |
-        | **动能崩溃 + 大利润** | 浮盈 >100% 且 signal 骤降 >50% | 止盈 30% |
-        | **其他** | — | HOLD（继续持有） |
-
-        **20 个输入特征：** 价格动量(ROC/波动率)、Volume 动态(趋势/突增)、
-        Holder 动量(增速/加速度)、VWAP、市场结构(mcap/holder)、趋势斜率
-
-        **核心优势：** 同样 -30% 的回调，如果 holder 还在增长 → 不止损（洗盘）。
-        如果 holder 也在流失 → 止损（真跌）。
-        """)
+    # ── Token Backtest Visualization ──
+    st.markdown("### 可视化：实际 Token 回测")
 
     POSITION_SIZE = 5000
 
-    # Keep TP/SL levels for reference but mark them as "legacy"
-    TP_LEVELS = [
-        (0.30, 0.15, "+30%: 先回一部分本金，降低心理压力"),
-        (0.80, 0.20, "+80%: 接近翻倍，锁定第一波利润"),
-        (2.00, 0.20, "+200%: 3x，已卖出超过一半本金"),
-        (5.00, 0.20, "+500%: 6x，大部分利润已锁定"),
-        (10.00, 0.15, "+1000%: 10x，留最后 10% 搏更大收益"),
-    ]
-    SL_LEVELS = [
-        (-0.15, 0.30, "-15%: 初步减仓"),
-        (-0.30, 0.30, "-30%: 大幅减仓"),
-        (-0.50, 1.00, "-50%: 硬止损"),
-    ]
-    TRAILING_STOP_PCT = 0.30
-
-    st.divider()
-
-    # ── Visualization with real token data ──
-    st.markdown("### 可视化：实际 Token 回测")
-
-    # Token selector from cluster #5 + #6
     cluster_csv = os.path.join(CLUSTER_DIR, "clusters.csv")
-    if os.path.isfile(cluster_csv):
-        cdf_all = pd.read_csv(cluster_csv)
-        organic_tokens = cdf_all[cdf_all["rank"].isin([5, 6])].sort_values("ath", ascending=False)
-        token_options = [f"{r['symbol']} (ATH ${r['ath']:,.0f}, #{r['rank']})"
-                         for _, r in organic_tokens.iterrows()]
-        selected_idx = st.selectbox("选择 Token 回测", range(len(token_options)),
-                                     format_func=lambda i: token_options[i],
-                                     index=0, key="pos_token_select")
-        selected_token = organic_tokens.iloc[selected_idx]
-    else:
+    if not os.path.isfile(cluster_csv):
         st.warning("聚类数据未找到")
         return
 
-    # Load actual price data
+    cdf_all = pd.read_csv(cluster_csv)
+    organic_tokens = cdf_all[cdf_all["rank"].isin([5, 6])].sort_values("ath", ascending=False)
+    token_options = [f"{r['symbol']} (ATH ${r['ath']:,.0f}, #{r['rank']})"
+                     for _, r in organic_tokens.iterrows()]
+    selected_idx = st.selectbox("选择 Token 回测", range(len(token_options)),
+                                 format_func=lambda i: token_options[i],
+                                 index=0, key="pos_token_select")
+    selected_token = organic_tokens.iloc[selected_idx]
     addr = selected_token["address"]
-    h_files = sorted([f for f in glob.glob(os.path.join(DATA_DIR, addr, "token_mcap_candles_[0-9]*.json"))
-                       if "5m" not in os.path.basename(f)])
-    if not h_files:
-        st.warning("无价格数据")
+
+    # Load data
+    from token_discovery.lifecycle_strategy import load_token_data, run_lifecycle_strategy, run_fixed_strategy, compute_life_signals
+
+    data = load_token_data(addr)
+    if data is None:
+        st.warning("无法加载数据")
         return
 
-    with open(h_files[-1]) as f:
-        raw = json.load(f)
-    candles = (raw or {}).get("data", {}).get("list", [])
-    if not candles:
-        st.warning("无蜡烛图数据")
-        return
+    mcap = data["mcap"]
+    volume = data["volume"]
+    holders = data["holders"]
+    n = len(mcap)
+    entry_price = mcap[0]
 
-    mcap_arr = np.array([float(c["close"]) for c in sorted(candles, key=lambda x: int(x["time"]))])
-    start_idx = next((i for i in range(len(mcap_arr)) if mcap_arr[i] >= 100000), None)
-    if start_idx is None:
-        st.warning("Token 市值未达到 $100K")
-        return
+    st.caption(f"**{selected_token['symbol']}** — 入场市值 ${entry_price:,.0f}，{n} 小时数据，"
+               f"ATH ${mcap.max():,.0f} (+{(mcap.max()/entry_price - 1)*100:.0f}%)")
 
-    mcap_arr = mcap_arr[start_idx:]
-    entry_price = mcap_arr[0]
-    price_pcts = (mcap_arr - entry_price) / entry_price
+    # Run lifecycle strategy and collect per-tick data
+    remaining = 1.0
+    realized = 0.0
+    peak_price = entry_price
+    lc_value = []
+    lc_markers = []
 
-    st.caption(f"**{selected_token['symbol']}** — 从市值 ${entry_price:,.0f} 入场，共 {len(price_pcts)} 小时数据")
-
-    # Load momentum model for this token
-    momentum_model_path = os.path.join("token_discovery", "momentum_model.cbm")
-    has_momentum = os.path.isfile(momentum_model_path)
-    if has_momentum:
-        from catboost import CatBoostRegressor
-        from token_discovery.momentum_model import compute_features_at_t, FEATURE_NAMES as MOM_FEATURES
-        mom_model = CatBoostRegressor()
-        mom_model.load_model(momentum_model_path)
-        holders_arr = load_trajectories([addr]).get(addr)
-        h_vals = np.zeros(len(mcap_arr[start_idx:]))
-        if holders_arr is not None and "holders" in holders_arr.columns:
-            h_vals = holders_arr["holders"].fillna(0).values[:len(h_vals)]
-        volume_full = np.array([float(c.get("volume", 0)) for c in sorted(candles, key=lambda x: int(x["time"]))])[start_idx:]
-
-    # Strategy simulation
-    remaining_strat = 1.0
-    peak_gain = 0.0
-    trailing_active = False
-    realized_strat = 0.0
-    strat_value = []
-    strat_remaining = []
-    tp_markers = []
-    sl_markers = []
-
-    # Track which TP/SL levels have been triggered
-    tp_triggered = [False] * len(TP_LEVELS)
-    sl_triggered = [False] * len(SL_LEVELS)
-    trailing_triggered = False
-
-    for i, pct in enumerate(price_pcts):
-        if remaining_strat <= 0.001:
-            strat_value.append(realized_strat)
-            strat_remaining.append(0)
+    for t in range(n):
+        if remaining <= 0.001:
+            lc_value.append(realized)
             continue
 
-        current_value = remaining_strat * POSITION_SIZE * (1 + pct) + realized_strat
-        peak_gain = max(peak_gain, pct)
+        current = mcap[t]
+        pnl = (current - entry_price) / max(entry_price, 1)
+        peak_price = max(peak_price, current)
+        dd_from_peak = (current - peak_price) / max(peak_price, 1)
 
-        # Check TP levels
-        for j, (trigger, sell_pct, _) in enumerate(TP_LEVELS):
-            if not tp_triggered[j] and pct >= trigger and remaining_strat > 0.001:
-                actual_sell = min(sell_pct, remaining_strat)
-                realized_strat += actual_sell * POSITION_SIZE * (1 + pct)
-                remaining_strat -= actual_sell
-                tp_triggered[j] = True
-                tp_markers.append((i, pct, f"TP {trigger*100:.0f}%\n卖{actual_sell*100:.0f}%"))
+        signals = compute_life_signals(mcap, volume, holders, t)
 
-        # Check trailing stop for last portion
-        if all(tp_triggered) and not trailing_triggered and remaining_strat > 0.001:
-            trailing_active = True
-            if pct < peak_gain * (1 - TRAILING_STOP_PCT):
-                realized_strat += remaining_strat * POSITION_SIZE * (1 + pct)
-                tp_markers.append((i, pct, f"Trailing Stop\n卖{remaining_strat*100:.0f}%"))
-                remaining_strat = 0
-                trailing_triggered = True
+        action = None
+        if signals:
+            if dd_from_peak < -0.70 and not signals["holder_growing"]:
+                sell = remaining
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining = 0
+                action = "EXIT(rug)"
+            elif signals["declining_hours"] >= 24 and remaining > 0:
+                sell = remaining
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining = 0
+                action = "EXIT(24h)"
+            elif signals["declining_hours"] >= 12 and signals["volume_trend"] < 0.5:
+                sell = min(0.40, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP40%"
+            elif signals["declining_hours"] >= 6:
+                sell = min(0.25, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP25%"
+            elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.50:
+                sell = min(0.20, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP20%(stagnant)"
 
-        # Check SL levels (only if price is negative from entry)
-        if pct < 0:
-            for j, (trigger, sell_pct, _) in enumerate(SL_LEVELS):
-                if not sl_triggered[j] and pct <= trigger and remaining_strat > 0.001:
-                    actual_sell = min(sell_pct, remaining_strat)
-                    realized_strat += actual_sell * POSITION_SIZE * (1 + pct)
-                    remaining_strat -= actual_sell
-                    sl_triggered[j] = True
-                    sl_markers.append((i, pct, f"SL {trigger*100:.0f}%\n卖{actual_sell*100:.0f}%"))
+        total = realized + remaining * POSITION_SIZE * (1 + pnl)
+        lc_value.append(total)
 
-        total = remaining_strat * POSITION_SIZE * (1 + pct) + realized_strat
-        strat_value.append(total)
-        strat_remaining.append(remaining_strat)
+        if action:
+            lc_markers.append((t, total, action))
 
-    # ── Momentum Strategy Simulation ──
-    mom_value = []
-    mom_markers = []
-    if has_momentum:
-        mom_remaining = 1.0
-        mom_realized = 0.0
-        mom_prev_signal = 0.0
+    if remaining > 0.001:
+        final_pnl = (mcap[-1] - entry_price) / max(entry_price, 1)
+        realized += remaining * final_pnl * POSITION_SIZE * (1 - SLIPPAGE)
+        lc_value[-1] = realized + remaining * POSITION_SIZE * (1 + final_pnl)
 
-        for t in range(len(price_pcts)):
-            pct = price_pcts[t]
-            if mom_remaining <= 0.001:
-                mom_value.append(mom_realized)
-                continue
-
-            # Compute momentum signal
-            if t >= 12:
-                mfeat = compute_features_at_t(mcap_arr[start_idx:], volume_full, h_vals, t)
-                if mfeat:
-                    mvec = np.array([[mfeat.get(f, 0) for f in MOM_FEATURES]])
-                    mvec = np.nan_to_num(mvec, nan=0)
-                    signal = float(mom_model.predict(mvec)[0])
-                else:
-                    signal = 0
-            else:
-                signal = 0
-
-            # Momentum decisions
-            action = None
-            if signal < -0.10 and mom_remaining > 0:
-                sell = mom_remaining
-                mom_realized += sell * pct * POSITION_SIZE * 0.97
-                action = f"EXIT (sig={signal:.0%})"
-                mom_remaining = 0
-            elif signal < -0.03 and pct < -0.10 and mom_remaining > 0:
-                sell = min(0.50, mom_remaining)
-                mom_realized += sell * pct * POSITION_SIZE * 0.97
-                mom_remaining -= sell
-                action = f"SL 50% (sig={signal:.0%})"
-            elif pct > 0.30 and signal < 0.02 and mom_prev_signal > 0.05:
-                sell = min(0.25, mom_remaining)
-                mom_realized += sell * pct * POSITION_SIZE * 0.97
-                mom_remaining -= sell
-                action = f"TP 25% (fade)"
-            elif pct > 1.0 and signal < mom_prev_signal * 0.5 and signal < 0.05:
-                sell = min(0.30, mom_remaining)
-                mom_realized += sell * pct * POSITION_SIZE * 0.97
-                mom_remaining -= sell
-                action = f"TP 30% (collapse)"
-
-            if action:
-                mom_markers.append((t, mom_realized + mom_remaining * POSITION_SIZE * (1 + pct), action))
-
-            mom_prev_signal = signal
-            mom_value.append(mom_realized + mom_remaining * POSITION_SIZE * (1 + pct))
-
-        # Force close
-        if mom_remaining > 0.001:
-            mom_realized += mom_remaining * price_pcts[-1] * POSITION_SIZE * 0.97
-            mom_value[-1] = mom_realized + mom_remaining * POSITION_SIZE * (1 + price_pcts[-1])
-
-    # Hold-to-end comparison
-    hold_value = [POSITION_SIZE * (1 + p) for p in price_pcts]
+    # Fixed strategy
+    fixed_ret = run_fixed_strategy(mcap)
+    # Reconstruct fixed value curve
+    FIXED_TP = [(0.30, 0.15), (0.80, 0.20), (2.00, 0.20), (5.00, 0.20), (10.00, 0.15)]
+    FIXED_SL = [(-0.15, 0.30), (-0.30, 0.30), (-0.50, 1.00)]
+    rem_f = 1.0; real_f = 0.0
+    tp_f = [False]*len(FIXED_TP); sl_f = [False]*len(FIXED_SL)
+    fixed_value = []
+    for t in range(n):
+        pnl = (mcap[t] - entry_price) / max(entry_price, 1)
+        if rem_f > 0.001:
+            for j, (tr, sp) in enumerate(FIXED_TP):
+                if not tp_f[j] and pnl >= tr:
+                    s = min(sp, rem_f); real_f += s * pnl * POSITION_SIZE * 0.97; rem_f -= s; tp_f[j] = True
+            if pnl < 0:
+                for j, (tr, sp) in enumerate(FIXED_SL):
+                    if not sl_f[j] and pnl <= tr:
+                        s = min(sp, rem_f); real_f += s * pnl * POSITION_SIZE * 0.97; rem_f -= s; sl_f[j] = True
+        fixed_value.append(real_f + rem_f * POSITION_SIZE * (1 + pnl))
 
     # Build chart
+    hold_value = [POSITION_SIZE * (1 + (mcap[t] - entry_price) / max(entry_price, 1)) for t in range(n)]
+
     fig = go.Figure()
 
-    # Buy & Hold
-    fig.add_trace(go.Scatter(
-        x=list(range(len(price_pcts))),
-        y=[POSITION_SIZE * (1 + p) for p in price_pcts],
-        mode="lines", line=dict(color="#d1d5db", width=1, dash="dot"),
-        name="持有不卖 (Buy & Hold)",
-    ))
+    fig.add_trace(go.Scatter(x=list(range(n)), y=hold_value,
+                              mode="lines", line=dict(color="#d1d5db", width=1, dash="dot"),
+                              name="Buy & Hold"))
 
-    # Momentum strategy
-    if mom_value:
+    fig.add_trace(go.Scatter(x=list(range(n)), y=lc_value,
+                              mode="lines", line=dict(color="#3b82f6", width=3),
+                              name="Lifecycle Strategy"))
+
+    fig.add_trace(go.Scatter(x=list(range(n)), y=fixed_value,
+                              mode="lines", line=dict(color="#22c55e", width=2, dash="dash"),
+                              name="Fixed TP/SL"))
+
+    # Lifecycle markers
+    for t, val, label in lc_markers:
+        color = "#22c55e" if "TP" in label else "#ef4444"
         fig.add_trace(go.Scatter(
-            x=list(range(len(mom_value))),
-            y=mom_value,
-            mode="lines", line=dict(color="#3b82f6", width=3),
-            name="Momentum Model",
-        ))
-        for idx, val, label in mom_markers:
-            color = "#22c55e" if "TP" in label else "#ef4444"
-            fig.add_trace(go.Scatter(
-                x=[idx], y=[val], mode="markers+text",
-                marker=dict(size=10, color=color, symbol="diamond"),
-                text=[label], textposition="top center", textfont=dict(size=8, color=color),
-                showlegend=False,
-            ))
+            x=[t], y=[val], mode="markers+text",
+            marker=dict(size=10, color=color, symbol="diamond"),
+            text=[label], textposition="top center", textfont=dict(size=8, color=color),
+            showlegend=False))
 
-    # Fixed TP/SL strategy
-    fig.add_trace(go.Scatter(
-        x=list(range(len(strat_value))),
-        y=strat_value,
-        mode="lines", line=dict(color="#22c55e", width=2, dash="dash"),
-        name="Fixed TP/SL",
-    ))
+    # Holder overlay (secondary y axis)
+    if holders.max() > 0:
+        fig.add_trace(go.Scatter(x=list(range(n)), y=holders,
+                                  mode="lines", line=dict(color="#f59e0b", width=1, dash="dot"),
+                                  name="Holders", yaxis="y2", opacity=0.5))
 
-    # TP markers
-    for idx, pct, label in tp_markers:
-        fig.add_trace(go.Scatter(
-            x=[idx], y=[strat_value[idx]], mode="markers+text",
-            marker=dict(size=12, color="#22c55e", symbol="triangle-up"),
-            text=[label], textposition="top center", textfont=dict(size=9, color="#22c55e"),
-            showlegend=False,
-        ))
-
-    # SL markers
-    for idx, pct, label in sl_markers:
-        fig.add_trace(go.Scatter(
-            x=[idx], y=[strat_value[idx]], mode="markers+text",
-            marker=dict(size=12, color="#ef4444", symbol="triangle-down"),
-            text=[label], textposition="bottom center", textfont=dict(size=9, color="#ef4444"),
-            showlegend=False,
-        ))
-
-    # Entry line
     fig.add_hline(y=POSITION_SIZE, line_dash="dash", line_color="#94a3b8",
                    annotation_text=f"Entry: ${POSITION_SIZE:,}", annotation_position="left")
 
     fig.update_layout(
-        title=f"{selected_token['symbol']} — 分批止盈止损 vs 持有不卖",
-        yaxis_title="账户价值 ($)",
-        xaxis_title="时间 (小时)",
-        height=500,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        title=f"{selected_token['symbol']} — Lifecycle Strategy vs Fixed vs Hold",
+        yaxis_title="账户价值 ($)", xaxis_title="时间 (小时)",
+        yaxis2=dict(title="Holders", overlaying="y", side="right", showgrid=False),
+        height=550, legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Final PnL summary
-    final_fixed = strat_value[-1] if strat_value else POSITION_SIZE
-    final_mom = mom_value[-1] if mom_value else POSITION_SIZE
-    final_hold = POSITION_SIZE * (1 + price_pcts[-1])
+    # Final PnL
+    final_lc = lc_value[-1] if lc_value else POSITION_SIZE
+    final_fixed = fixed_value[-1] if fixed_value else POSITION_SIZE
+    final_hold = hold_value[-1]
 
     col_s1, col_s2, col_s3 = st.columns(3)
-    col_s1.metric("Momentum Model", f"${final_mom:,.0f}",
-                   f"{(final_mom/POSITION_SIZE - 1)*100:+.0f}%")
+    col_s1.metric("Lifecycle Strategy", f"${final_lc:,.0f}",
+                   f"{(final_lc/POSITION_SIZE - 1)*100:+.0f}%")
     col_s2.metric("Fixed TP/SL", f"${final_fixed:,.0f}",
                    f"{(final_fixed/POSITION_SIZE - 1)*100:+.0f}%")
     col_s3.metric("Buy & Hold", f"${final_hold:,.0f}",
                    f"{(final_hold/POSITION_SIZE - 1)*100:+.0f}%")
+
+    # Holder chart detail
+    if holders.max() > 0:
+        st.caption("黄色虚线 = Holder 数量（右轴）。Lifecycle Strategy 在 holder 开始下降时才卖出。")
 
 
 
