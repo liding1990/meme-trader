@@ -462,7 +462,7 @@ def section_scatter(df):
 def section_regression(df):
     """Regression 分析 — 针对 Organic cluster 的关键特征回归。"""
     st.markdown("## Regression 分析")
-    st.markdown("针对 **#5 Organic Runner** 和 **#6 Fast Organic** 的关键特征对进行回归分析，发现增长规律。")
+    st.markdown("针对 **#5 Organic Runner** 和 **#6 Fast Organic** 的关键特征对进行二次多项式回归，发现增长规律。")
 
     from scipy import stats as sp_stats
 
@@ -471,24 +471,79 @@ def section_regression(df):
     organic["cluster_name"] = organic["rank"].map(
         lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}")
 
-    # Predefined regression pairs
+    # Predefined pairs with descriptions, ordered by R²
     REGRESSION_PAIRS = [
-        ("volume_roc", "price_roc", "Volume增速 ($/h)", "价格增速 ($/h)"),
-        ("holder_roc", "ath", "Holder增速 (/h)", "ATH ($)"),
-        ("rise_hours", "ath", "上升时长 (h)", "ATH ($)"),
-        ("holders_at_ath", "ath", "Holder@ATH", "ATH ($)"),
-        ("volume_roc", "ath", "Volume增速 ($/h)", "ATH ($)"),
-        ("holder_roc", "price_roc", "Holder增速 (/h)", "价格增速 ($/h)"),
+        ("volume_roc", "holder_roc", "Volume增速 ($/h)", "Holder增速 (/h)",
+         "成交量越大的 token，holder 涌入速度越快。Volume 是吸引新用户的核心引擎。"),
+        ("price_roc", "holder_roc", "价格增速 ($/h)", "Holder增速 (/h)",
+         "价格涨得越快，holder 增长越快。价格上涨本身就是最好的营销。"),
+        ("price_roc", "volume_roc", "价格增速 ($/h)", "Volume增速 ($/h)",
+         "价格增速和成交量增速高度正相关。真正的上涨伴随着真实的成交量放大。"),
+        ("rise_hours", "price_roc", "上升时长 (h)", "价格增速 ($/h)",
+         "上升时间越长的 token，每小时价格增速越低。慢牛和快牛是两种完全不同的模式。"),
+        ("ath", "holders_at_ath", "ATH ($)", "Holder@ATH",
+         "ATH 越高的 token，峰值时持币人越多。大市值需要大社区支撑。"),
+        ("price_roc", "holder_decay_roc", "价格增速 ($/h)", "Holder衰减 (/h)",
+         "涨得越快的 token，衰减时 holder 流失也越快。来得快去得快。"),
+        ("decay_hours", "holder_decay_roc", "衰减时长 (h)", "Holder衰减 (/h)",
+         "衰减时间越长，每小时 holder 流失越慢。慢慢跌的 token 社区粘性更强。"),
+        ("holder_roc", "holders_at_ath", "Holder增速 (/h)", "Holder@ATH",
+         "每小时 holder 增速越快，最终 holder 峰值越高。增长动量决定了天花板。"),
+        ("ath", "price_roc", "ATH ($)", "价格增速 ($/h)",
+         "ATH 越高的 token 价格增速越快。大 runner 的特征是增速本身就快。"),
+        ("price_roc", "holders_at_ath", "价格增速 ($/h)", "Holder@ATH",
+         "价格增速越高，ATH 时 holder 越多。快速上涨吸引的不是投机客就是真信徒。"),
     ]
 
-    pair_labels = [f"{x_label} vs {y_label}" for _, _, x_label, y_label in REGRESSION_PAIRS]
+    # Precompute R² for all pairs
+    pair_r2 = []
+    for x_col, y_col, x_label, y_label, desc in REGRESSION_PAIRS:
+        sub = organic[(organic[x_col] > 0) & (organic[y_col] > 0)]
+        if len(sub) < 10:
+            pair_r2.append(0)
+            continue
+        lx = np.log10(sub[x_col].values)
+        ly = np.log10(sub[y_col].values)
+        coeffs = np.polyfit(lx, ly, 2)
+        poly = np.poly1d(coeffs)
+        y_pred = poly(lx)
+        ss_res = np.sum((ly - y_pred) ** 2)
+        ss_tot = np.sum((ly - ly.mean()) ** 2)
+        pair_r2.append(1 - ss_res / max(ss_tot, 1e-9))
+
+    # Summary table (sorted by R²)
+    st.markdown("### 分析维度总览（按 R² 排序）")
+    summary_rows = []
+    for i, (x_col, y_col, x_label, y_label, desc) in enumerate(REGRESSION_PAIRS):
+        r2 = pair_r2[i]
+        if r2 > 0.5:
+            strength = "强"
+            icon = "🟢"
+        elif r2 > 0.3:
+            strength = "中等"
+            icon = "🟡"
+        else:
+            strength = "弱"
+            icon = "🔴"
+        summary_rows.append({
+            "关联强度": f"{icon} {strength}",
+            "R²": f"{r2:.3f}",
+            "X 轴": x_label,
+            "Y 轴": y_label,
+            "解读": desc,
+        })
+    summary_rows.sort(key=lambda x: float(x["R²"]), reverse=True)
+    st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # Pair selector
+    pair_labels = [f"{x_label} vs {y_label}" for _, _, x_label, y_label, _ in REGRESSION_PAIRS]
     selected_pair = st.selectbox("选择分析维度", pair_labels, index=0, key="reg_pair")
     pair_idx = pair_labels.index(selected_pair)
-    x_col, y_col, x_label, y_label = REGRESSION_PAIRS[pair_idx]
+    x_col, y_col, x_label, y_label, pair_desc = REGRESSION_PAIRS[pair_idx]
 
-    # Regression type selector
-    col_pair, col_degree = st.columns([2, 1])
-    degree = col_degree.slider("Polynomial 阶数", min_value=1, max_value=4, value=2, key="reg_degree")
+    degree = 2  # fixed polynomial degree
 
     # Filter valid data (positive values for log)
     plot_df = organic[(organic[x_col] > 0) & (organic[y_col] > 0)].copy()
@@ -590,7 +645,9 @@ def section_regression(df):
     st.markdown(f"""
     ### 解读
 
-    **R² = {r_squared:.3f}** — {x_label} 和 {y_label} 之间存在 **{strength}** 的{degree_name}关系。
+    > {pair_desc}
+
+    **R² = {r_squared:.3f}** — {x_label} 和 {y_label} 之间存在 **{strength}** 的非线性关系。
     {"（比线性回归提升 " + f"{r_squared - r_squared_lin:+.3f}" + "）" if degree > 1 and r_squared > r_squared_lin else ""}
 
     **回归方程（对数空间）：** `log(Y) = {equation}`
