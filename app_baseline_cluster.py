@@ -1095,17 +1095,40 @@ MENU = {
 if "page" not in st.session_state:
     st.session_state.page = "数据方法论"
 
+# Custom CSS for menu buttons
+st.markdown("""
+<style>
+div[data-testid="stSidebar"] .stButton > button {
+    text-align: left !important;
+    justify-content: flex-start !important;
+    padding: 4px 12px !important;
+    font-size: 0.9em !important;
+    border: none !important;
+    background: transparent !important;
+    color: #333 !important;
+}
+div[data-testid="stSidebar"] .stButton > button:hover {
+    background: #f0f0f0 !important;
+}
+div[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    color: #ef4444 !important;
+    font-weight: 600 !important;
+    background: #fef2f2 !important;
+    border-left: 3px solid #ef4444 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 with st.sidebar:
     st.title("Meme Trading System")
 
     for section, info in MENU.items():
         st.divider()
         st.markdown(f"**{section}**")
-        st.caption(info["caption"])
         for p in info["pages"]:
             is_active = st.session_state.page == p
             if st.button(
-                f"{'▸ ' if is_active else '　'}{p}",
+                p,
                 key=f"menu_{p}",
                 use_container_width=True,
                 type="primary" if is_active else "secondary",
