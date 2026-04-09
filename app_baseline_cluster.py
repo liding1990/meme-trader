@@ -675,6 +675,183 @@ def section_regression(df):
                     f"R²={sub_r2:.3f}")
 
 
+REGRESSION_PAIRS_FOR_QUERY = [
+    ("volume_roc", "holder_roc", "Volume增速 ($/h)", "Holder增速 (/h)",
+     "成交量越大的 token，holder 涌入速度越快。Volume 是吸引新用户的核心引擎。",
+     "holder 吸引效率", "volume_roc"),
+    ("price_roc", "volume_roc", "价格增速 ($/h)", "Volume增速 ($/h)",
+     "价格增速和成交量增速高度正相关。真正的上涨伴随着真实的成交量放大。",
+     "成交量真实性", "price_roc"),
+    ("ath", "holders_at_ath", "ATH ($)", "Holder@ATH",
+     "ATH 越高的 token，峰值时持币人越多。大市值需要大社区支撑。",
+     "市值可持续性", "ath"),
+    ("price_roc", "holder_roc", "价格增速 ($/h)", "Holder增速 (/h)",
+     "价格涨得越快，holder 增长越快。价格上涨本身就是最好的营销。",
+     "价格-社区联动", "price_roc"),
+    ("holder_roc", "holders_at_ath", "Holder增速 (/h)", "Holder@ATH",
+     "每小时 holder 增速越快，最终 holder 峰值越高。增长动量决定了天花板。",
+     "增长天花板", "holder_roc"),
+]
+
+
+def _render_regression_position(df, feat, symbol, rank):
+    """Render regression charts with the queried token's position highlighted."""
+    from scipy import stats as sp_stats
+
+    st.divider()
+    st.markdown("### Regression 位置分析")
+    st.markdown(f"以下展示 **{symbol}** 在各个关键维度上相对于 Organic 回归线的位置。"
+                f"**回归线上方 = 超预期，下方 = 不及预期。**")
+
+    organic = df[df["rank"].isin([5, 6])].copy()
+
+    z_scores = []
+
+    for x_col, y_col, x_label, y_label, desc, signal_name, _ in REGRESSION_PAIRS_FOR_QUERY:
+        sub = organic[(organic[x_col] > 0) & (organic[y_col] > 0)].copy()
+        if len(sub) < 10:
+            continue
+
+        token_x = feat.get(x_col, 0)
+        token_y = feat.get(y_col, 0)
+        if token_x <= 0 or token_y <= 0:
+            continue
+
+        log_x = np.log10(sub[x_col].values)
+        log_y = np.log10(sub[y_col].values)
+
+        # Poly-2 fit
+        coeffs = np.polyfit(log_x, log_y, 2)
+        poly = np.poly1d(coeffs)
+
+        y_pred_all = poly(log_x)
+        residual_std = np.std(log_y - y_pred_all)
+
+        # Token's position
+        token_log_x = np.log10(token_x)
+        token_log_y = np.log10(token_y)
+        expected_log_y = poly(token_log_x)
+        z = (token_log_y - expected_log_y) / max(residual_std, 1e-9)
+        z_scores.append((signal_name, z))
+
+        # Chart
+        x_range = np.linspace(log_x.min() - 0.2, log_x.max() + 0.2, 200)
+        y_fit = poly(x_range)
+
+        sub["cluster_name"] = sub["rank"].map(
+            lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}")
+        color_map = {f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}": CLUSTER_META.get(r, {}).get("color", "#999")
+                     for r in [5, 6]}
+
+        fig = px.scatter(sub, x=x_col, y=y_col, color="cluster_name",
+                          hover_name="symbol", log_x=True, log_y=True,
+                          color_discrete_map=color_map,
+                          labels={x_col: x_label, y_col: y_label, "cluster_name": "Cluster"})
+
+        # Regression line
+        fig.add_trace(go.Scatter(
+            x=10 ** x_range, y=10 ** y_fit,
+            mode="lines", line=dict(color="#ef4444", width=2.5),
+            name="回归线", showlegend=True,
+        ))
+
+        # Confidence band
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([10 ** x_range, 10 ** x_range[::-1]]),
+            y=np.concatenate([10 ** (y_fit + residual_std), 10 ** (y_fit - residual_std)[::-1]]),
+            fill="toself", fillcolor="rgba(239,68,68,0.08)",
+            line=dict(color="rgba(239,68,68,0)"),
+            name="±1σ", showlegend=True,
+        ))
+
+        # Token marker (large, prominent)
+        marker_color = "#22c55e" if z > 0 else "#ef4444"
+        fig.add_trace(go.Scatter(
+            x=[token_x], y=[token_y],
+            mode="markers+text",
+            marker=dict(size=16, color=marker_color, symbol="star",
+                         line=dict(width=2, color="white")),
+            text=[symbol], textposition="top center",
+            textfont=dict(size=13, color=marker_color, family="Arial Black"),
+            name=symbol, showlegend=True,
+        ))
+
+        fig.update_layout(height=420, margin=dict(l=0, r=0, t=30, b=0))
+        fig.update_traces(marker=dict(size=6, opacity=0.6), selector=dict(mode="markers"))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Description
+        if z > 1:
+            position_desc = f"**显著超预期**（z={z:+.2f}，top {(1-sp_stats.norm.cdf(z))*100:.0f}%）"
+            interpretation = f"在同等 {x_label} 水平下，{symbol} 的 {y_label} 远高于大多数 organic token。"
+        elif z > 0.3:
+            position_desc = f"**略超预期**（z={z:+.2f}）"
+            interpretation = f"{symbol} 的 {y_label} 高于回归预期值，表现不错。"
+        elif z > -0.3:
+            position_desc = f"**符合预期**（z={z:+.2f}）"
+            interpretation = f"{symbol} 在这个维度上表现正常，符合 organic token 的典型增长关系。"
+        elif z > -1:
+            position_desc = f"**略低于预期**（z={z:+.2f}）"
+            interpretation = f"{symbol} 的 {y_label} 低于回归预期，需要关注。"
+        else:
+            position_desc = f"**显著低于预期**（z={z:+.2f}，bottom {sp_stats.norm.cdf(z)*100:.0f}%）"
+            interpretation = f"在同等 {x_label} 水平下，{symbol} 的 {y_label} 远低于多数 organic token，可能存在风险。"
+
+        st.markdown(f"**{signal_name}：** {position_desc}")
+        st.markdown(f"> {desc}")
+        st.markdown(f"{interpretation}")
+        st.divider()
+
+    # Summary z-score card
+    if z_scores:
+        st.markdown("### Organic Quality Score 综合评分")
+        avg_z = np.mean([z for _, z in z_scores])
+
+        if avg_z > 0.5:
+            overall = "优秀"
+            overall_color = "#22c55e"
+            overall_desc = "该 token 在多数维度上超越 organic 回归预期，社区质量和增长动能优秀。"
+        elif avg_z > 0:
+            overall = "良好"
+            overall_color = "#3b82f6"
+            overall_desc = "该 token 整体表现在 organic 回归线附近或略上方，属于正常偏好。"
+        elif avg_z > -0.5:
+            overall = "一般"
+            overall_color = "#f59e0b"
+            overall_desc = "该 token 在部分维度低于预期，需要持续观察是否有改善趋势。"
+        else:
+            overall = "较差"
+            overall_color = "#ef4444"
+            overall_desc = "该 token 多数维度低于 organic 回归预期，增长质量存疑。"
+
+        col_score, col_detail = st.columns([1, 2])
+        with col_score:
+            st.markdown(f"""
+            <div style="text-align:center; padding:20px; background:{overall_color}10;
+                        border:2px solid {overall_color}; border-radius:12px;">
+                <div style="font-size:3em; font-weight:bold; color:{overall_color};">{avg_z:+.2f}</div>
+                <div style="font-size:1.2em; color:{overall_color};">{overall}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col_detail:
+            st.markdown(f"**{overall_desc}**")
+            st.markdown("各维度 z-score：")
+            for name, z in z_scores:
+                bar_width = min(abs(z) * 30, 100)
+                bar_color = "#22c55e" if z > 0 else "#ef4444"
+                direction = "+" if z > 0 else ""
+                st.markdown(
+                    f'<div style="margin:4px 0;">'
+                    f'<span style="display:inline-block; width:120px;">{name}</span>'
+                    f'<span style="display:inline-block; width:50px; text-align:right; font-weight:bold; color:{bar_color};">{direction}{z:.2f}</span>'
+                    f'<span style="display:inline-block; width:{bar_width}px; height:12px; '
+                    f'background:{bar_color}; border-radius:6px; margin-left:8px; vertical-align:middle;"></span>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+
 def section_query(df, model):
     """Token 查询 — 支持数据集内 token 和任意外部 token 地址。"""
     st.markdown("## Token 查询")
@@ -829,6 +1006,10 @@ def section_query(df, model):
     sim_display["ATH"] = sim_display["ATH"].apply(lambda x: f"${x:,.0f}")
     sim_display["距离"] = sim_display["距离"].apply(lambda x: f"{x:.2f}")
     st.dataframe(sim_display, hide_index=True)
+
+    # ── Regression Position Analysis (only for organic clusters #5, #6) ──
+    if rank in [5, 6]:
+        _render_regression_position(df, feat, symbol, rank)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
