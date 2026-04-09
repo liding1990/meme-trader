@@ -460,78 +460,156 @@ def section_scatter(df):
 
 
 def section_query(df, model):
-    """Token 查询。"""
+    """Token 查询 — 支持数据集内 token 和任意外部 token 地址。"""
     st.markdown("## Token 查询")
-    st.markdown("输入 token symbol 或地址，查看其所属 cluster。")
+    st.markdown("输入 token symbol（数据集内）或**任意合约地址**（自动从 GMGN 获取数据）。")
 
-    query = st.text_input("Token Symbol 或地址", placeholder="例如: PUNCH, BFS, 或合约地址...",
+    query = st.text_input("Token Symbol 或合约地址",
+                           placeholder="例如: PUNCH, BFS, 或 FaBXnb7UFBY81hi1Xg...",
                            key="cluster_query")
     if not query:
         return
 
+    from baseline_cluster_v2 import build_feature_vector, compute_features
+
     query_lower = query.strip().lower()
+    row = None
+    feat = None
+    symbol = "?"
+    is_oos = False
+
+    # Try in-sample first
     match = df[df["symbol"].str.lower() == query_lower]
     if match.empty:
         match = df[df["address"].str.lower() == query_lower]
     if match.empty:
         match = df[df["symbol"].str.lower().str.contains(query_lower, na=False)]
 
-    if match.empty:
-        st.warning(f"未找到「{query}」。仅支持查询数据集中的 token。")
-        return
+    if not match.empty:
+        row = match.iloc[0]
+        symbol = row["symbol"]
+        feat = {k: row[k] for k in [
+            "rise_hours", "price_roc", "volume_roc", "holder_roc",
+            "ath", "holders_at_ath", "decay_hours", "holder_decay_roc",
+            "price_decay_roc", "total_hours", "rise_pct",
+        ]}
+    else:
+        # Out-of-sample: try as contract address
+        address = query.strip()
+        if len(address) < 20:
+            st.warning(f"未找到「{query}」。请输入完整的合约地址来查询外部 token。")
+            return
 
-    row = match.iloc[0]
-    rank = int(row["rank"])
+        is_oos = True
+        with st.spinner(f"从 GMGN 获取 {address[:16]}... 的数据"):
+            # First check if we already have data locally
+            feat = compute_features(address)
+
+            if feat is None:
+                # Fetch from GMGN
+                try:
+                    from gmgn_api import fetch_token_data
+                    fetch_token_data("sol", address)
+                    feat = compute_features(address)
+                except Exception as e:
+                    st.error(f"获取数据失败: {e}")
+                    return
+
+        if feat is None:
+            st.warning("无法计算特征。可能原因：token 市值未达 $100K，或数据不足。")
+            return
+
+        # Try to get symbol
+        data_dir = os.path.join(DATA_DIR, address)
+        h_files = sorted(glob.glob(os.path.join(data_dir, "token_mcap_candles_[0-9]*.json")))
+        if h_files:
+            try:
+                with open(h_files[-1]) as f:
+                    raw = json.load(f)
+                s = (raw or {}).get("data", {}).get("symbol")
+                if s:
+                    symbol = s
+            except Exception:
+                pass
+        if symbol == "?":
+            symbol = address[:12] + "..."
+
+    # Predict cluster
+    scaler = model["scaler"]
+    km = model["kmeans"]
+    cluster_order = model["cluster_order"]
+    rank_map = {c: i + 1 for i, c in enumerate(cluster_order)}
+
+    vec = scaler.transform([build_feature_vector(feat)])
+    cid = int(km.predict(vec)[0])
+    rank = rank_map.get(cid, 0)
     meta = CLUSTER_META.get(rank, {})
     color = meta.get("color", "#888")
-    same_cluster = df[df["rank"] == rank]
+    same_cluster = df[df["cluster_id"] == cid]
 
+    # Header
+    oos_badge = ' <span style="background:#f59e0b; color:white; padding:2px 8px; border-radius:8px; font-size:0.75em;">OUT-OF-SAMPLE</span>' if is_oos else ''
     st.markdown(f"""
     <div style="border-left: 5px solid {color}; padding: 12px 16px; margin: 16px 0; background: {color}10;">
-        <h3 style="margin:0;">{row['symbol']} → <span style="color:{color};">#{rank} {meta.get('name', '?')}</span></h3>
-        <p style="margin:4px 0 0 0; color: #666;">{meta.get('name_cn', '')}</p>
+        <h3 style="margin:0;">{symbol} → <span style="color:{color};">#{rank} {meta.get('name', '?')}</span>{oos_badge}</h3>
+        <p style="margin:4px 0 0 0; color: #666;">{meta.get('name_cn', '')} — {meta.get('desc', '')[:80]}...</p>
     </div>
     """, unsafe_allow_html=True)
 
     # Token features
     col1, col2, col3 = st.columns(3)
-    col1.metric("ATH", f"${row['ath']:,.0f}")
-    col1.metric("价格增速", f"${row['price_roc']:,.0f}/h")
-    col2.metric("上升时长", f"{row['rise_hours']:.0f}h")
-    col2.metric("衰减时长", f"{row['decay_hours']:.0f}h")
-    col3.metric("Holder@ATH", f"{row['holders_at_ath']:,.0f}")
-    col3.metric("Holder增速", f"{row['holder_roc']:.1f}/h")
+    col1.metric("ATH", f"${feat['ath']:,.0f}")
+    col1.metric("价格增速", f"${feat['price_roc']:,.0f}/h")
+    col2.metric("上升时长", f"{feat['rise_hours']:.0f}h")
+    col2.metric("衰减时长", f"{feat['decay_hours']:.0f}h")
+    col3.metric("Holder@ATH", f"{feat['holders_at_ath']:,.0f}")
+    col3.metric("Holder增速", f"{feat['holder_roc']:.1f}/h")
 
-    # Same cluster stats
+    # Cluster comparison
     st.markdown(f"### 同 Cluster 对比（#{rank} {meta.get('name', '?')}, {len(same_cluster)} tokens）")
     compare = pd.DataFrame({
-        "指标": ["ATH", "上升时长", "衰减时长", "Holder@ATH", "价格增速"],
+        "指标": ["ATH", "上升时长", "衰减时长", "Holder@ATH", "价格增速", "总时长", "上升占比"],
         "该 Token": [
-            f"${row['ath']:,.0f}", f"{row['rise_hours']:.0f}h", f"{row['decay_hours']:.0f}h",
-            f"{row['holders_at_ath']:,.0f}", f"${row['price_roc']:,.0f}/h"
+            f"${feat['ath']:,.0f}", f"{feat['rise_hours']:.0f}h", f"{feat['decay_hours']:.0f}h",
+            f"{feat['holders_at_ath']:,.0f}", f"${feat['price_roc']:,.0f}/h",
+            f"{feat['total_hours']:.0f}h", f"{feat['rise_pct']:.0%}",
         ],
         "Cluster 中位": [
             f"${same_cluster['ath'].median():,.0f}", f"{same_cluster['rise_hours'].median():.0f}h",
             f"{same_cluster['decay_hours'].median():.0f}h",
             f"{same_cluster['holders_at_ath'].median():,.0f}",
-            f"${same_cluster['price_roc'].median():,.0f}/h"
+            f"${same_cluster['price_roc'].median():,.0f}/h",
+            f"{same_cluster['total_hours'].median():.0f}h",
+            f"{same_cluster['rise_pct'].median():.0%}",
         ],
     })
     st.dataframe(compare, hide_index=True)
 
+    # Distance to all clusters
+    st.markdown("### 到各 Cluster 的距离")
+    dist_rows = []
+    for c in cluster_order:
+        d = float(np.linalg.norm(vec[0] - km.cluster_centers_[c]))
+        r = rank_map[c]
+        m = CLUSTER_META.get(r, {})
+        dist_rows.append({
+            "Cluster": f"#{r} {m.get('name', '?')}",
+            "距离": f"{d:.2f}",
+            "": "← 当前" if c == cid else "",
+        })
+    st.dataframe(pd.DataFrame(dist_rows), hide_index=True)
+
     # Similar tokens
-    from baseline_cluster_v2 import build_feature_vector
-    scaler = model["scaler"]
-    query_vec = scaler.transform([build_feature_vector(row)])
     member_vecs = scaler.transform([build_feature_vector(r) for _, r in same_cluster.iterrows()])
-    dists = np.sqrt(((member_vecs - query_vec[0]) ** 2).sum(axis=1))
+    dists = np.sqrt(((member_vecs - vec[0]) ** 2).sum(axis=1))
     same_cluster = same_cluster.copy()
     same_cluster["distance"] = dists
-    similar = same_cluster[same_cluster["symbol"] != row["symbol"]].nsmallest(8, "distance")
+    similar = same_cluster.nsmallest(8, "distance")
 
-    st.markdown("### 最相似 Token")
-    sim_display = similar[["symbol", "ath", "rise_hours", "decay_hours", "holders_at_ath", "distance"]].copy()
-    sim_display.columns = ["Token", "ATH", "上升(h)", "衰减(h)", "Holder@ATH", "距离"]
+    st.markdown("### 最相似的历史 Token")
+    sim_display = similar[["symbol", "ath", "rise_hours", "decay_hours",
+                            "holders_at_ath", "holder_roc", "distance"]].copy()
+    sim_display.columns = ["Token", "ATH", "上升(h)", "衰减(h)", "Holder@ATH", "Holder增速(/h)", "距离"]
     sim_display["ATH"] = sim_display["ATH"].apply(lambda x: f"${x:,.0f}")
     sim_display["距离"] = sim_display["距离"].apply(lambda x: f"{x:.2f}")
     st.dataframe(sim_display, hide_index=True)
