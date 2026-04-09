@@ -74,12 +74,16 @@ def compute_regression_zscore(baseline_df, x_col, y_col, token_x, token_y):
     return float(np.clip(z, -5, 5))
 
 
-def score_candidate(address, baseline_df):
-    """Re-compute features for a candidate and calculate z-scores."""
+def score_candidate(address, baseline_df, skip_fetch=False):
+    """Re-compute features for a candidate and calculate z-scores.
+
+    Args:
+        skip_fetch: If True, only use local data (no GMGN API calls).
+    """
     from baseline_cluster_v2 import compute_features
 
     feat = compute_features(address)
-    if feat is None:
+    if feat is None and not skip_fetch:
         # Try fetching fresh data
         try:
             from gmgn_api import fetch_token_data

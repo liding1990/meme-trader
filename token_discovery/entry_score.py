@@ -11,6 +11,9 @@ Modifiers:
   - Freshness decay: newer tokens score higher (1.0 → 0.3 over 720h)
   - Health penalty: tokens that dumped from peak get penalized (drawdown + 24h crash)
 
+Regression scores are refreshed from local data on every run (no API calls).
+Health penalty uses Codex real-time marketCap to catch dumps between data refreshes.
+
 Usage:
     PYTHONPATH=. python -m token_discovery.entry_score          # run once
     PYTHONPATH=. python -m token_discovery.entry_score --loop   # run every 15 min
@@ -29,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from codex_api import _query, CODEX_API_KEY
 from token_discovery import db
+from token_discovery.monitor import score_candidate, load_baseline_data
 from token_discovery.pipeline import setup_logger
 
 ENTRY_INTERVAL = 15 * 60  # 15 minutes
@@ -204,10 +208,44 @@ def run_once():
         log.info("No candidates in pool")
         return
 
-    # Build regression score lookup
-    reg_scores = {}
+    # Build regression score lookup from DB (fallback)
+    reg_scores_db = {}
     for s in scores_data:
-        reg_scores[s["address"]] = s["composite_score"]
+        reg_scores_db[s["address"]] = s["composite_score"]
+
+    # Re-compute regression z-scores from latest local data (fast, no API calls)
+    baseline_df = load_baseline_data()
+    reg_scores = {}
+    if baseline_df is not None:
+        refreshed = 0
+        for _c in candidates:
+            addr = _c["address"]
+            result = score_candidate(addr, baseline_df, skip_fetch=True)
+            if result is not None:
+                reg_scores[addr] = result["composite_score"]
+                # Also update candidate_scores DB
+                feat = result["feat"]
+                db.upsert_score(
+                    address=addr, symbol=_c["symbol"],
+                    current_mcap=feat.get("ath", 0),
+                    current_holders=feat.get("holders_at_ath", 0),
+                    current_ath=feat.get("ath", 0),
+                    current_rise_hours=feat.get("rise_hours", 0),
+                    current_price_roc=feat.get("price_roc", 0),
+                    current_volume_roc=feat.get("volume_roc", 0),
+                    current_holder_roc=feat.get("holder_roc", 0),
+                    current_holders_at_ath=feat.get("holders_at_ath", 0),
+                    **result["z_scores"],
+                    composite_score=result["composite_score"],
+                )
+                refreshed += 1
+            else:
+                # Fallback to DB cached value
+                reg_scores[addr] = reg_scores_db.get(addr, 0)
+        log.info(f"Refreshed regression scores for {refreshed}/{len(candidates)} candidates")
+    else:
+        reg_scores = reg_scores_db
+        log.warning("Baseline data not available, using cached regression scores")
 
     # Fetch real-time stats from Codex
     addresses = [c["address"] for c in candidates]
