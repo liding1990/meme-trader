@@ -1134,160 +1134,56 @@ MONITOR_REGRESSION_PAIRS = [
 
 
 def section_candidate_monitor(df):
-    """Candidate Monitor — regression-based scoring of pool tokens."""
+    """Candidate Monitor — Entry Score + Regression analysis, merged view."""
     from token_discovery import db as disc_db
     disc_db.init_db()
 
     st.markdown("## Candidate Monitor")
-    st.markdown("基于 Regression 分析对 Candidate Pool 中的 token 实时评分排序。每小时自动更新。")
-    st.code("PYTHONPATH=. python -m token_discovery.monitor --loop", language="bash")
+    st.markdown("持续监测 Candidate Pool，基于 Regression 质量 + 实时量价信号进行综合评分。")
 
-    with st.expander("评分权重说明"):
+    with st.expander("权重与评分说明"):
         st.markdown("""
-        | 维度 | 权重 | ATH预测力 | 说明 |
-        |---|---|---|---|
-        | **增长天花板** | 35% | r=0.71 | Holder增速→最终Holder峰值，最强预测因子 |
-        | **Holder吸引效率** | 25% | r=0.25 | Volume→Holder转化率，独立信号 |
-        | **成交量真实性** | 20% | r=0.45 | Price→Volume关系，验证成交量真伪 |
-        | **市值可持续性** | 10% | r≈0 | ATH→Holders@ATH，弱预测力 |
-        | **价格-社区联动** | 10% | r=0.43 | 与成交量真实性冗余(r=0.61)，降权 |
-        """)
+        **Entry Score (0-100) = 加权综合分**
 
-    scores = disc_db.get_scores()
-
-    if not scores:
-        st.info("暂无评分数据。运行 `PYTHONPATH=. python -m token_discovery.monitor` 生成。")
-        return
-
-    sdf = pd.DataFrame([dict(s) for s in scores])
-
-    # ── Ranked Table ──
-    st.markdown(f"### 评分排名（{len(sdf)} 个 Candidate）")
-
-    rank_data = []
-    for i, (_, r) in enumerate(sdf.iterrows()):
-        zs = {
-            "holder吸引效率": r["z_holder_efficiency"],
-            "成交量真实性": r["z_volume_authenticity"],
-            "市值可持续性": r["z_mcap_sustainability"],
-            "价格-社区联动": r["z_price_community"],
-            "增长天花板": r["z_growth_ceiling"],
-        }
-        best_dim = max(zs, key=zs.get)
-        worst_dim = min(zs, key=zs.get)
-
-        rank_data.append({
-            "排名": i + 1,
-            "Token": r["symbol"],
-            "综合分": f"{r['composite_score']:+.2f}",
-            "ATH": f"${r['current_ath']:,.0f}",
-            "Holders": f"{r['current_holders']:,.0f}",
-            "上升时长": f"{r['current_rise_hours']:.0f}h",
-            "最强维度": f"{best_dim} ({zs[best_dim]:+.2f})",
-            "最弱维度": f"{worst_dim} ({zs[worst_dim]:+.2f})",
-            "更新": r["updated_at"][:16],
-        })
-    st.dataframe(pd.DataFrame(rank_data), hide_index=True, use_container_width=True)
-
-    # ── Regression Plots ──
-    st.divider()
-    st.markdown("### Regression 维度分析")
-    st.markdown("*灰色 = 历史 baseline，彩色 = 当前 candidate（绿>0.3, 黄中间, 红<-0.3）*")
-
-    organic = df[df["rank"].isin([5, 6])].copy()
-
-    for x_col, y_col, x_label, y_label, dim_name, z_col in MONITOR_REGRESSION_PAIRS:
-        sub = organic[(organic[x_col] > 0) & (organic[y_col] > 0)]
-        if len(sub) < 10:
-            continue
-
-        log_x = np.log10(sub[x_col].values)
-        log_y = np.log10(sub[y_col].values)
-        coeffs = np.polyfit(log_x, log_y, 2)
-        poly = np.poly1d(coeffs)
-        x_range = np.linspace(log_x.min() - 0.3, log_x.max() + 0.3, 200)
-        y_fit = poly(x_range)
-        residual_std = np.std(log_y - poly(log_x))
-
-        col_map = {
-            "volume_roc": "current_volume_roc", "price_roc": "current_price_roc",
-            "holder_roc": "current_holder_roc", "ath": "current_ath",
-            "holders_at_ath": "current_holders_at_ath",
-        }
-        sx, sy = col_map.get(x_col, x_col), col_map.get(y_col, y_col)
-        valid = sdf[(sdf[sx] > 0) & (sdf[sy] > 0)].copy()
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=sub[x_col], y=sub[y_col], mode="markers",
-                                  marker=dict(size=4, color="#d1d5db", opacity=0.4),
-                                  name="Baseline", hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=10**x_range, y=10**y_fit, mode="lines",
-                                  line=dict(color="#ef4444", width=2), name="回归线"))
-        fig.add_trace(go.Scatter(
-            x=np.concatenate([10**x_range, 10**x_range[::-1]]),
-            y=np.concatenate([10**(y_fit+residual_std), 10**(y_fit-residual_std)[::-1]]),
-            fill="toself", fillcolor="rgba(239,68,68,0.06)",
-            line=dict(color="rgba(0,0,0,0)"), showlegend=False))
-
-        if len(valid) > 0:
-            colors = ["#22c55e" if z > 0.3 else "#ef4444" if z < -0.3 else "#f59e0b"
-                       for z in valid[z_col]]
-            fig.add_trace(go.Scatter(
-                x=valid[sx], y=valid[sy], mode="markers+text",
-                marker=dict(size=10, color=colors, line=dict(width=1, color="white")),
-                text=valid["symbol"], textposition="top center", textfont=dict(size=9),
-                hovertext=[f"<b>{r['symbol']}</b><br>z={r[z_col]:+.2f}" for _, r in valid.iterrows()],
-                hoverinfo="text", name="Candidates"))
-
-        fig.update_layout(title=f"{dim_name}: {x_label} vs {y_label}",
-                           xaxis_title=x_label, yaxis_title=y_label,
-                           xaxis_type="log", yaxis_type="log",
-                           height=400, margin=dict(l=50, r=20, t=40, b=40))
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def section_entry_score():
-    """Entry Score — ranked candidates with dimension breakdown."""
-    from token_discovery import db as disc_db
-    disc_db.init_db()
-
-    st.markdown("## Entry Score")
-    st.markdown("基于 5 个维度对 Candidate 进行连续评分（0-100），排名越高越适合入场。")
-    st.code("PYTHONPATH=. python -m token_discovery.entry_score --loop", language="bash")
-
-    with st.expander("评分权重"):
-        st.markdown("""
         | 维度 | 权重 | 计算方式 | 性质 |
         |---|---|---|---|
-        | **Regression 质量** | 50% | Candidate Monitor 综合 z-score 归一化 | 结构性（全周期） |
+        | **Regression 质量** | 50% | 5 个 regression z-score 加权综合 | 结构性（全周期增长质量） |
         | **动量强度** | 15% | 4h 涨幅归一化 (0%→0, 50%→1) | 短期趋势 |
         | **放量程度** | 15% | 近4h vol / 24h均值4h vol (1x→0, 3x→1) | 短期成交量 |
-        | **买卖压力** | 10% | buy/(buy+sell) 比例 (0.5→0, 0.7→1) | 短期方向 |
-        | **Holder 动量** | 10% | 当前holders vs发现时holders增长率 (0%→0, 20%→1) | 短期社区 |
+        | **买卖压力** | 10% | buy/(buy+sell) (0.5→0, 0.7→1) | 短期方向 |
+        | **Holder 动量** | 10% | 当前holders vs发现时增长率 (0%→0, 20%→1) | 短期社区 |
+
+        **Regression 质量内部权重:**
+        增长天花板 35% | Holder吸引效率 25% | 成交量真实性 20% | 市值可持续性 10% | 价格-社区联动 10%
         """)
 
-    # Load entry scores from DB
+    # ── Load Entry Scores ──
     conn = disc_db.get_conn()
     try:
-        rows = conn.execute("SELECT * FROM entry_scores ORDER BY entry_score DESC").fetchall()
+        entry_rows = conn.execute("SELECT * FROM entry_scores ORDER BY entry_score DESC").fetchall()
     except Exception:
-        rows = []
+        entry_rows = []
     conn.close()
 
-    if not rows:
-        st.info("暂无 Entry Score 数据。运行 `PYTHONPATH=. python -m token_discovery.entry_score` 生成。")
+    scores = disc_db.get_scores()
+    sdf = pd.DataFrame([dict(s) for s in scores]) if scores else pd.DataFrame()
+
+    if not entry_rows:
+        st.info("暂无评分数据。运行以下命令生成：")
+        st.code("PYTHONPATH=. python -m token_discovery.monitor && PYTHONPATH=. python -m token_discovery.entry_score", language="bash")
         return
 
-    edf = pd.DataFrame([dict(r) for r in rows])
+    edf = pd.DataFrame([dict(r) for r in entry_rows])
 
-    # Top metrics
-    col1, col2, col3 = st.columns(3)
+    # ── Top Metrics ──
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Candidates", f"{len(edf)}")
     col2.metric("最高分", f"{edf['entry_score'].max():.1f}")
     col3.metric("中位分", f"{edf['entry_score'].median():.1f}")
+    col4.metric("平均分", f"{edf['entry_score'].mean():.1f}")
 
-    # Ranked table with dimension bars
-    st.markdown("### 排名")
+    # ── Ranked Table ──
+    st.markdown("### Entry Score 排名")
 
     table_rows = []
     for i, (_, r) in enumerate(edf.iterrows()):
@@ -1306,7 +1202,7 @@ def section_entry_score():
         })
     st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
 
-    # Dimension breakdown chart for top 10
+    # ── Top 10 Dimension Breakdown ──
     st.divider()
     st.markdown("### Top 10 维度分解")
 
@@ -1321,28 +1217,76 @@ def section_entry_score():
             ("s_holder", "Holder (10%)", "#a855f7"),
         ]
         weights = [0.50, 0.15, 0.15, 0.10, 0.10]
-
         for (col, name, color), w in zip(dims, weights):
             fig.add_trace(go.Bar(
-                y=top10["symbol"],
-                x=top10[col] * w * 100,
-                name=name,
-                orientation="h",
-                marker_color=color,
+                y=top10["symbol"], x=top10[col] * w * 100,
+                name=name, orientation="h", marker_color=color,
             ))
-
-        fig.update_layout(
-            barmode="stack",
-            title="Entry Score 组成（加权）",
-            xaxis_title="Score",
-            yaxis=dict(autorange="reversed"),
-            height=400,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        )
+        fig.update_layout(barmode="stack", title="Entry Score 组成（加权）",
+                           xaxis_title="Score", yaxis=dict(autorange="reversed"),
+                           height=400, legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Score distribution
-    st.markdown("### 分数分布")
+    # ── Regression Plots ──
+    if len(sdf) > 0:
+        st.divider()
+        st.markdown("### Regression 维度分析")
+        st.markdown("*灰色 = 历史 baseline，彩色 = 当前 candidate（绿>0.3, 黄中间, 红<-0.3）*")
+
+        organic = df[df["rank"].isin([5, 6])].copy()
+
+        for x_col, y_col, x_label, y_label, dim_name, z_col in MONITOR_REGRESSION_PAIRS:
+            sub = organic[(organic[x_col] > 0) & (organic[y_col] > 0)]
+            if len(sub) < 10:
+                continue
+
+            log_x = np.log10(sub[x_col].values)
+            log_y = np.log10(sub[y_col].values)
+            coeffs = np.polyfit(log_x, log_y, 2)
+            poly = np.poly1d(coeffs)
+            x_range = np.linspace(log_x.min() - 0.3, log_x.max() + 0.3, 200)
+            y_fit = poly(x_range)
+            residual_std = np.std(log_y - poly(log_x))
+
+            col_map = {
+                "volume_roc": "current_volume_roc", "price_roc": "current_price_roc",
+                "holder_roc": "current_holder_roc", "ath": "current_ath",
+                "holders_at_ath": "current_holders_at_ath",
+            }
+            sx, sy = col_map.get(x_col, x_col), col_map.get(y_col, y_col)
+            valid = sdf[(sdf[sx] > 0) & (sdf[sy] > 0)].copy()
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=sub[x_col], y=sub[y_col], mode="markers",
+                                      marker=dict(size=4, color="#d1d5db", opacity=0.4),
+                                      name="Baseline", hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=10**x_range, y=10**y_fit, mode="lines",
+                                      line=dict(color="#ef4444", width=2), name="回归线"))
+            fig.add_trace(go.Scatter(
+                x=np.concatenate([10**x_range, 10**x_range[::-1]]),
+                y=np.concatenate([10**(y_fit+residual_std), 10**(y_fit-residual_std)[::-1]]),
+                fill="toself", fillcolor="rgba(239,68,68,0.06)",
+                line=dict(color="rgba(0,0,0,0)"), showlegend=False))
+
+            if len(valid) > 0:
+                colors = ["#22c55e" if z > 0.3 else "#ef4444" if z < -0.3 else "#f59e0b"
+                           for z in valid[z_col]]
+                fig.add_trace(go.Scatter(
+                    x=valid[sx], y=valid[sy], mode="markers+text",
+                    marker=dict(size=10, color=colors, line=dict(width=1, color="white")),
+                    text=valid["symbol"], textposition="top center", textfont=dict(size=9),
+                    hovertext=[f"<b>{r['symbol']}</b><br>z={r[z_col]:+.2f}" for _, r in valid.iterrows()],
+                    hoverinfo="text", name="Candidates"))
+
+            fig.update_layout(title=f"{dim_name}: {x_label} vs {y_label}",
+                               xaxis_title=x_label, yaxis_title=y_label,
+                               xaxis_type="log", yaxis_type="log",
+                               height=400, margin=dict(l=50, r=20, t=40, b=40))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Score Distribution ──
+    st.divider()
+    st.markdown("### Entry Score 分布")
     fig_hist = px.histogram(edf, x="entry_score", nbins=20,
                              title=f"Entry Score 分布（{len(edf)} candidates）",
                              labels={"entry_score": "Entry Score"},
@@ -1359,7 +1303,7 @@ MENU = {
     },
     "Token Discovery": {
         "caption": "漏斗筛选 → 量化信号 → 进场",
-        "pages": ["L1: Cluster 筛选", "Candidate Monitor", "Entry Score"],
+        "pages": ["L1: Cluster 筛选", "Candidate Monitor"],
     },
 }
 
@@ -1438,5 +1382,3 @@ elif page in DISCOVERY_PAGES:
         section_l1_filter(df, model)
     elif page == "Candidate Monitor":
         section_candidate_monitor(df)
-    elif page == "Entry Score":
-        section_entry_score()
