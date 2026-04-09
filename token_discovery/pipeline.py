@@ -124,6 +124,7 @@ def scan_codex():
           network: [1399811149]
           marketCap: {{gte: 100000}}
           holders: {{gte: 200}}
+          volume4: {{gte: 5000}}
           createdAt: {{gte: {one_month_ago}}}
           launchpadName: [{lp_list}]
           trendingIgnored: false
@@ -143,6 +144,7 @@ def scan_codex():
           buyCount4
           sellCount4
           priceUSD
+          createdAt
           token {{
             address
             name
@@ -238,6 +240,8 @@ def run_once():
         liquidity = float(t.get("liquidity", 0) or 0)
         buy4h = int(t.get("buyCount4", 0) or 0)
         sell4h = int(t.get("sellCount4", 0) or 0)
+        created_at = int(t.get("createdAt", 0) or 0)
+        lifetime_hours = (time.time() - created_at) / 3600 if created_at > 0 else 0
 
         rank, cluster_name, feat = classify_token(addr, model)
         gmgn_fetched += 1
@@ -246,6 +250,7 @@ def run_once():
         detail = {
             "symbol": sym, "address": addr, "mcap": mcap,
             "holders": holders, "vol4h": vol4h, "change4h": change4h,
+            "lifetime_hours": round(lifetime_hours, 1),
             "cluster_rank": rank, "cluster_name": cluster_name or "无法分类",
             "passed_l1": rank in [5, 6] if rank else False,
         }
@@ -277,6 +282,7 @@ def run_once():
                 holders_at_ath=feat.get("holders_at_ath", 0),
                 total_hours=feat.get("total_hours", 0),
                 rise_pct=feat.get("rise_pct", 0),
+                lifetime_hours=lifetime_hours,
             )
             if is_new:
                 new_candidates += 1

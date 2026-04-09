@@ -42,6 +42,7 @@ def init_db():
         holders_at_ath REAL DEFAULT 0,
         total_hours REAL DEFAULT 0,
         rise_pct REAL DEFAULT 0,
+        lifetime_hours REAL DEFAULT 0,
         status TEXT DEFAULT 'active'
     );
 
@@ -63,7 +64,8 @@ def init_db():
 def add_candidate(address, symbol, name, cluster_rank, cluster_name,
                    mcap, holders, vol4h, change4h, liquidity, buy4h, sell4h,
                    ath, rise_hours, decay_hours, price_roc, volume_roc,
-                   holder_roc, holders_at_ath, total_hours, rise_pct):
+                   holder_roc, holders_at_ath, total_hours, rise_pct,
+                   lifetime_hours=0):
     """Add or update a candidate. Returns True if new, False if existing."""
     conn = get_conn()
     existing = conn.execute("SELECT address FROM candidate_pool WHERE address=?", (address,)).fetchone()
@@ -78,13 +80,13 @@ def add_candidate(address, symbol, name, cluster_rank, cluster_name,
             mcap_at_discovery, holders_at_discovery, vol4h_at_discovery,
             change4h_at_discovery, liquidity_at_discovery, buy4h, sell4h,
             ath, rise_hours, decay_hours, price_roc, volume_roc,
-            holder_roc, holders_at_ath, total_hours, rise_pct
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            holder_roc, holders_at_ath, total_hours, rise_pct, lifetime_hours
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (address, symbol, name, cluster_rank, cluster_name,
           datetime.now(timezone.utc).isoformat(),
           mcap, holders, vol4h, change4h, liquidity, buy4h, sell4h,
           ath, rise_hours, decay_hours, price_roc, volume_roc,
-          holder_roc, holders_at_ath, total_hours, rise_pct))
+          holder_roc, holders_at_ath, total_hours, rise_pct, lifetime_hours))
     conn.commit()
     conn.close()
     return True

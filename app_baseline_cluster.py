@@ -1028,6 +1028,10 @@ def section_l1_filter(df, model):
             lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}"
         )
 
+        # Handle missing lifetime_hours column (old data)
+        if "lifetime_hours" not in cdf.columns:
+            cdf["lifetime_hours"] = 0
+
         fig = go.Figure()
         for rank in [5, 6]:
             sub = cdf[cdf["cluster_rank"] == rank]
@@ -1037,7 +1041,7 @@ def section_l1_filter(df, model):
             fig.add_trace(go.Scatter3d(
                 x=sub["mcap_at_discovery"],
                 y=sub["holders_at_discovery"],
-                z=sub["vol4h_at_discovery"],
+                z=sub["lifetime_hours"].clip(lower=0.1),
                 mode="markers",
                 marker=dict(size=6, color=color_map[rank], opacity=0.8),
                 text=[
@@ -1045,7 +1049,7 @@ def section_l1_filter(df, model):
                     f"#{r['cluster_rank']} {meta.get('name', '?')}<br>"
                     f"MCap: ${r['mcap_at_discovery']:,.0f}<br>"
                     f"Holders: {r['holders_at_discovery']:,}<br>"
-                    f"Vol 4h: ${r['vol4h_at_discovery']:,.0f}<br>"
+                    f"Lifetime: {r.get('lifetime_hours', 0):.0f}h<br>"
                     f"发现: {r['first_seen'][:16]}"
                     for _, r in sub.iterrows()
                 ],
@@ -1057,10 +1061,10 @@ def section_l1_filter(df, model):
             scene=dict(
                 xaxis_title="MCap at Discovery ($)",
                 yaxis_title="Holders",
-                zaxis_title="Volume 4h ($)",
+                zaxis_title="Token Lifetime (hours)",
                 xaxis=dict(type="log", backgroundcolor="white", gridcolor="rgb(200,200,200)"),
                 yaxis=dict(type="log", backgroundcolor="white", gridcolor="rgb(200,200,200)"),
-                zaxis=dict(type="log", backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+                zaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)"),
                 bgcolor="white",
             ),
             paper_bgcolor="white",
