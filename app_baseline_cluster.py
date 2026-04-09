@@ -1189,7 +1189,11 @@ def section_candidate_monitor(df):
     for i, (_, r) in enumerate(edf.iterrows()):
         raw = r.get("raw_score", r["entry_score"])
         fresh = r.get("freshness", 1.0)
+        hp = r.get("health", 1.0) if pd.notna(r.get("health")) else 1.0
         lifetime = r.get("lifetime_hours", 0)
+        cur_mcap = r.get("current_mcap", 0) if pd.notna(r.get("current_mcap")) else 0
+        peak_mcap = r.get("peak_mcap", 0) if pd.notna(r.get("peak_mcap")) else 0
+        dd = f"{(1 - cur_mcap / peak_mcap) * 100:.0f}%" if peak_mcap > 0 and cur_mcap > 0 else ""
         table_rows.append({
             "排名": i + 1,
             "Token": r["symbol"],
@@ -1197,6 +1201,8 @@ def section_candidate_monitor(df):
             "Entry Score": f"{r['entry_score']:.1f}",
             "原始分": f"{raw:.1f}",
             "新鲜度": f"{fresh:.0%}",
+            "健康度": f"{hp:.0%}",
+            "回撤": dd,
             "Token Age": f"{lifetime:.0f}h" if lifetime else "",
             "Reg (50%)": f"{r['s_regression']:.2f}",
             "动量 (15%)": f"{r['s_momentum']:.2f}",

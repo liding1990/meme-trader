@@ -7,6 +7,10 @@ Computes a 0-100 entry score based on 5 weighted dimensions:
   - Buy Pressure (10%): buy/sell ratio
   - Holder Momentum (10%): recent holder growth
 
+Modifiers:
+  - Freshness decay: newer tokens score higher (1.0 → 0.3 over 720h)
+  - Health penalty: tokens that dumped from peak get penalized (drawdown + 24h crash)
+
 Usage:
     PYTHONPATH=. python -m token_discovery.entry_score          # run once
     PYTHONPATH=. python -m token_discovery.entry_score --loop   # run every 15 min
@@ -55,9 +59,11 @@ def fetch_realtime_stats(addresses):
         limit: 200
       ) {{
         results {{
+          marketCap
           volume4
           volume24
           change4
+          change24
           buyCount4
           sellCount4
           holders
@@ -77,9 +83,11 @@ def fetch_realtime_stats(addresses):
             addr = t.get("token", {}).get("address", "")
             if addr:
                 stats[addr] = {
+                    "marketCap": float(t.get("marketCap", 0) or 0),
                     "volume4": float(t.get("volume4", 0) or 0),
                     "volume24": float(t.get("volume24", 0) or 0),
                     "change4": float(t.get("change4", 0) or 0),
+                    "change24": float(t.get("change24", 0) or 0),
                     "buyCount4": int(t.get("buyCount4", 0) or 0),
                     "sellCount4": int(t.get("sellCount4", 0) or 0),
                     "holders": int(t.get("holders", 0) or 0),
@@ -129,6 +137,39 @@ def score_holder_momentum(current_holders, discovery_holders):
 def score_regression(composite_zscore):
     """Regression z-score → 0-1 score. z=-1→0, z=0→0.5, z=1→1."""
     return min(max((composite_zscore + 1) / 2, 0), 1.0)
+
+
+def health_penalty(current_mcap, peak_mcap, change24):
+    """Penalize tokens that have dumped from their peak.
+
+    Returns a multiplier 0.0-1.0:
+      Drawdown < 20%: no penalty (1.0)
+      Drawdown 20-50%: linear decay to 0.5
+      Drawdown 50-80%: linear decay to 0.1
+      Drawdown > 80%: near-zero (0.05)
+      24h change < -30%: additional penalty (floor at 0.3x)
+    """
+    if peak_mcap <= 0 or current_mcap <= 0:
+        return 1.0
+
+    drawdown = 1.0 - (current_mcap / peak_mcap)
+
+    if drawdown < 0.20:
+        dd_mult = 1.0
+    elif drawdown < 0.50:
+        dd_mult = 1.0 - (drawdown - 0.20) / 0.30 * 0.5  # 1.0 → 0.5
+    elif drawdown < 0.80:
+        dd_mult = 0.5 - (drawdown - 0.50) / 0.30 * 0.4  # 0.5 → 0.1
+    else:
+        dd_mult = 0.05
+
+    # Additional 24h crash penalty
+    if change24 < -0.30:
+        crash_mult = max(0.3, 1.0 + change24)  # -50% → 0.5, -70% → 0.3
+    else:
+        crash_mult = 1.0
+
+    return dd_mult * crash_mult
 
 
 def freshness_decay(lifetime_hours):
@@ -198,7 +239,7 @@ def run_once():
         s_buy = score_buy_pressure(stats.get("buyCount4", 0), stats.get("sellCount4", 0))
         s_holder = score_holder_momentum(stats.get("holders", 0), c["holders_at_discovery"])
 
-        # Weighted composite (0-100) with freshness decay
+        # Weighted composite (0-100) with freshness decay + health penalty
         raw_score = (
             s_regression * W_REGRESSION +
             s_momentum * W_MOMENTUM +
@@ -209,7 +250,31 @@ def run_once():
 
         lifetime = c.get("lifetime_hours", 0) or 0
         decay = freshness_decay(lifetime)
-        entry_score = raw_score * decay
+
+        # Health penalty: penalize tokens that have dumped from peak
+        current_mcap = stats.get("marketCap", 0)
+        # Peak = max of: candidate_pool ATH, discovery mcap, candidate_scores ATH
+        score_ath = 0
+        for sc in scores_data:
+            if sc["address"] == addr:
+                try:
+                    score_ath = sc["current_ath"] or 0
+                except (KeyError, IndexError):
+                    pass
+                break
+        peak_mcap = max(
+            c.get("ath", 0) or 0,                    # from candidate_pool
+            c.get("mcap_at_discovery", 0) or 0,      # at discovery
+            score_ath,                                 # from candidate_scores
+        )
+        # If current_mcap available and peak known, use mcap-based drawdown
+        if current_mcap > 0 and peak_mcap > 0:
+            # Ensure peak is at least current (peak should always >= current)
+            peak_mcap = max(peak_mcap, current_mcap)
+        change24 = stats.get("change24", 0)
+        hp = health_penalty(current_mcap, peak_mcap, change24)
+
+        entry_score = raw_score * decay * hp
 
         results.append({
             "address": addr,
@@ -217,6 +282,7 @@ def run_once():
             "entry_score": round(entry_score, 1),
             "raw_score": round(raw_score, 1),
             "freshness": round(decay, 2),
+            "health": round(hp, 2),
             "lifetime_hours": round(lifetime, 0),
             "s_regression": round(s_regression, 3),
             "s_momentum": round(s_momentum, 3),
@@ -224,6 +290,9 @@ def run_once():
             "s_buy": round(s_buy, 3),
             "s_holder": round(s_holder, 3),
             "change4h": stats.get("change4", 0),
+            "change24h": change24,
+            "current_mcap": current_mcap,
+            "peak_mcap": peak_mcap,
             "vol4h": stats.get("volume4", 0),
             "holders": stats.get("holders", 0),
             "reg_z": reg_z,
@@ -242,6 +311,7 @@ def run_once():
             entry_score REAL DEFAULT 0,
             raw_score REAL DEFAULT 0,
             freshness REAL DEFAULT 1,
+            health REAL DEFAULT 1,
             lifetime_hours REAL DEFAULT 0,
             s_regression REAL DEFAULT 0,
             s_momentum REAL DEFAULT 0,
@@ -249,24 +319,37 @@ def run_once():
             s_buy REAL DEFAULT 0,
             s_holder REAL DEFAULT 0,
             change4h REAL DEFAULT 0,
+            change24h REAL DEFAULT 0,
+            current_mcap REAL DEFAULT 0,
+            peak_mcap REAL DEFAULT 0,
             vol4h REAL DEFAULT 0,
             holders INTEGER DEFAULT 0,
             reg_z REAL DEFAULT 0
         )
     """)
+    # Add new columns if table already exists (migration)
+    for col, coltype in [("health", "REAL DEFAULT 1"), ("change24h", "REAL DEFAULT 0"),
+                          ("current_mcap", "REAL DEFAULT 0"), ("peak_mcap", "REAL DEFAULT 0")]:
+        try:
+            conn.execute(f"ALTER TABLE entry_scores ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass  # column already exists
+
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
         conn.execute("""
             INSERT OR REPLACE INTO entry_scores (
-                address, symbol, updated_at, entry_score, raw_score, freshness, lifetime_hours,
+                address, symbol, updated_at, entry_score, raw_score, freshness, health,
+                lifetime_hours,
                 s_regression, s_momentum, s_volume, s_buy, s_holder,
-                change4h, vol4h, holders, reg_z
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                change4h, change24h, current_mcap, peak_mcap, vol4h, holders, reg_z
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (r["address"], r["symbol"], now, r["entry_score"], r["raw_score"],
-              r["freshness"], r["lifetime_hours"],
+              r["freshness"], r["health"], r["lifetime_hours"],
               r["s_regression"], r["s_momentum"], r["s_volume"],
               r["s_buy"], r["s_holder"],
-              r["change4h"], r["vol4h"], r["holders"], r["reg_z"]))
+              r["change4h"], r["change24h"], r["current_mcap"], r["peak_mcap"],
+              r["vol4h"], r["holders"], r["reg_z"]))
     conn.commit()
     conn.close()
 
@@ -274,6 +357,7 @@ def run_once():
     log.info(f"\nEntry Score Rankings ({len(results)} candidates):")
     for i, r in enumerate(results[:15]):
         log.info(f"  {i+1:>2d}. {r['symbol']:>12s}  score={r['entry_score']:>5.1f}  "
+                 f"raw={r['raw_score']:.1f} fresh={r['freshness']:.0%} health={r['health']:.0%}  "
                  f"reg={r['s_regression']:.2f} mom={r['s_momentum']:.2f} "
                  f"vol={r['s_volume']:.2f} buy={r['s_buy']:.2f} hold={r['s_holder']:.2f}")
 
