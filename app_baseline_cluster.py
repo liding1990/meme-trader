@@ -1080,81 +1080,43 @@ if df is None:
     st.error("聚类数据未找到。请先运行 `python baseline_cluster_v2.py`。")
     st.stop()
 
-# All pages in order, grouped by section
-ALL_PAGES = [
-    ("Baseline Cluster v2", "数据方法论"),
-    ("Baseline Cluster v2", "聚类结果"),
-    ("Baseline Cluster v2", "3D 轨迹图"),
-    ("Baseline Cluster v2", "散点分析"),
-    ("Baseline Cluster v2", "Regression 分析"),
-    ("Baseline Cluster v2", "Token 查询"),
-    ("Token Discovery", "L1: Cluster 筛选"),
-]
+# Single unified navigation — one radio group with section headers outside
+CLUSTER_PAGES = ["数据方法论", "聚类结果", "3D 轨迹图", "散点分析", "Regression 分析", "Token 查询"]
+DISCOVERY_PAGES = ["L1: Cluster 筛选"]
+ALL_PAGES = CLUSTER_PAGES + DISCOVERY_PAGES
 
-# Sidebar
 with st.sidebar:
     st.title("Meme Trading System")
     st.divider()
-
     st.markdown("##### Baseline Cluster v2")
     st.caption(f"{len(df)} tokens · 6 clusters · 2026年后")
-    cluster_page = st.radio(
-        "cluster_nav",
-        ["数据方法论", "聚类结果", "3D 轨迹图", "散点分析", "Regression 分析", "Token 查询"],
-        label_visibility="collapsed",
-        key="cluster_page",
-    )
-
-    st.divider()
-
     st.markdown("##### Token Discovery")
     st.caption("漏斗筛选 → 量化信号 → 进场")
-    discovery_page = st.radio(
-        "discovery_nav",
-        ["L1: Cluster 筛选"],
-        label_visibility="collapsed",
-        key="discovery_page",
-    )
+    st.divider()
 
-# Determine which section is active based on which radio was last clicked
-# Streamlit reruns on every interaction, so we track via session_state
-if "prev_cluster" not in st.session_state:
-    st.session_state.prev_cluster = cluster_page
-if "prev_discovery" not in st.session_state:
-    st.session_state.prev_discovery = discovery_page
+    page = st.radio("导航", ALL_PAGES, label_visibility="collapsed", key="main_nav")
 
-cluster_changed = cluster_page != st.session_state.prev_cluster
-discovery_changed = discovery_page != st.session_state.prev_discovery
-
-if discovery_changed:
-    active_section = "discovery"
-else:
-    active_section = "cluster"
-
-st.session_state.prev_cluster = cluster_page
-st.session_state.prev_discovery = discovery_page
-
-# Content
-if active_section == "cluster":
+# Content routing
+if page in CLUSTER_PAGES:
     st.title("Baseline Clustering v2")
     st.caption("基于结果特征的 Memecoin 生命周期聚类 | 500 tokens · 6 clusters · 11 features")
 
-    if cluster_page == "数据方法论":
+    if page == "数据方法论":
         section_methodology()
-    elif cluster_page == "聚类结果":
+    elif page == "聚类结果":
         section_clusters(df)
-    elif cluster_page == "3D 轨迹图":
+    elif page == "3D 轨迹图":
         section_3d_chart(df)
-    elif cluster_page == "散点分析":
+    elif page == "散点分析":
         section_scatter(df)
-    elif cluster_page == "Regression 分析":
+    elif page == "Regression 分析":
         section_regression(df)
-    elif cluster_page == "Token 查询":
+    elif page == "Token 查询":
         section_query(df, model)
 
-else:
+elif page in DISCOVERY_PAGES:
     st.title("Token Discovery")
     st.caption("市场扫描 → Cluster 筛选 → 量化信号 → 进场")
 
-    if discovery_page == "L1: Cluster 筛选":
+    if page == "L1: Cluster 筛选":
         section_l1_filter(df, model)
