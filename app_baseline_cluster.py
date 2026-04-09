@@ -1374,6 +1374,7 @@ def section_position_management():
     st.markdown("### 可视化：实际 Token 回测")
 
     POSITION_SIZE = 5000
+    SLIPPAGE = 0.03
 
     cluster_csv = os.path.join(CLUSTER_DIR, "clusters.csv")
     if not os.path.isfile(cluster_csv):
