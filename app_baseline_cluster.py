@@ -967,108 +967,239 @@ def section_query(df, model):
 # ── Token Discovery: L1 Cluster Filter ───────────────────────────────────────
 
 
+LAUNCHPADS = [
+    "Pump.fun", "Pump Mayhem", "Bonk", "Believe", "Moonshot",
+    "Jupiter Studio", "boop", "Heaven", "LaunchLab", "Moonit",
+    "TokenMill V2", "MeteoraDBC", "Zora Solana", "Cooking.City",
+    "Circus", "BAGS", "time.fun", "Dealr",
+]
+
+
+def _scan_trending_tokens():
+    """Scan Codex for trending launchpad tokens."""
+    import time as _time
+    from codex_api import _query
+
+    one_month_ago = int(_time.time()) - 30 * 86400
+    lp_list = ", ".join(f'"{lp}"' for lp in LAUNCHPADS)
+
+    query = f'''
+    query FilterTokens {{
+      filterTokens(
+        filters: {{
+          network: [1399811149]
+          marketCap: {{gte: 100000}}
+          holders: {{gte: 200}}
+          createdAt: {{gte: {one_month_ago}}}
+          launchpadName: [{lp_list}]
+          trendingIgnored: false
+          potentialScam: false
+        }}
+        statsType: FILTERED
+        rankings: [{{attribute: trendingScore4, direction: DESC}}]
+        limit: 200
+        offset: 0
+      ) {{
+        results {{
+          marketCap
+          holders
+          liquidity
+          volume4
+          volume24
+          change4
+          change24
+          buyCount4
+          sellCount4
+          uniqueBuys4
+          uniqueSells4
+          priceUSD
+          token {{
+            address
+            name
+            symbol
+            isScam
+          }}
+        }}
+        count
+      }}
+    }}
+    '''
+    result = _query(query)
+    ft = result.get("filterTokens", {})
+    return ft.get("results", []), ft.get("count", 0)
+
+
+def _classify_token_for_l1(address, model):
+    """Classify a token via GMGN data + KMeans model. Returns (rank, feat) or (None, None)."""
+    from baseline_cluster_v2 import build_feature_vector, compute_features
+    from gmgn_api import fetch_token_data
+
+    feat = compute_features(address)
+    if feat is None:
+        try:
+            fetch_token_data("sol", address)
+            feat = compute_features(address)
+        except Exception:
+            pass
+    if feat is None:
+        return None, None
+
+    scaler = model["scaler"]
+    km = model["kmeans"]
+    cluster_order = model["cluster_order"]
+    rank_map = {c: i + 1 for i, c in enumerate(cluster_order)}
+
+    vec = scaler.transform([build_feature_vector(feat)])
+    cid = int(km.predict(vec)[0])
+    rank = rank_map.get(cid, 0)
+    return rank, feat
+
+
 def section_l1_filter(df, model):
-    """L1 漏斗：基于 Cluster 的第一层筛选。"""
+    """L1 漏斗：Codex 实时扫描 + Cluster 筛选。"""
     st.markdown("## L1: Cluster 筛选")
 
     st.markdown("""
-    ### 筛选逻辑
-
-    从全市场扫描到的 token 中，通过 Baseline Clustering v2 模型判断其所属 cluster。
-    **只有落入 Cluster #5 (Organic Runner) 或 #6 (Fast Organic) 的 token 才进入下一层。**
+    **漏斗逻辑：** Codex 实时扫描 Trending Token → 获取 GMGN 历史数据 → 计算生命周期特征 → KMeans 预测 Cluster → 仅保留 #5 和 #6
 
     ```
-    全市场 Token
+    Codex Trending (4h, Solana launchpad, MCap>100K, Holders>200, age<30d, no scam)
+        ↓ 获取 GMGN 小时级数据
         ↓ 计算 11 个生命周期特征
         ↓ KMeans 预测 cluster
-        ↓ 仅保留 #5 和 #6
-    Candidate Pool（进入 L2 监测）
+        ↓ 仅保留 #5 Organic Runner 和 #6 Fast Organic
+    Candidate Pool
     ```
     """)
 
-    st.markdown("### 漏斗概览")
+    # Scan button
+    if st.button("🔍 扫描 Trending Token", type="primary", use_container_width=True):
+        with st.spinner("从 Codex 获取 Trending Token..."):
+            try:
+                tokens, total_count = _scan_trending_tokens()
+            except Exception as e:
+                st.error(f"Codex 扫描失败: {e}")
+                return
 
-    col1, col2, col3 = st.columns(3)
+        if not tokens:
+            st.warning("未找到符合条件的 token")
+            return
 
-    n_total = len(df)
-    n_organic = len(df[df["rank"].isin([5, 6])])
-    n_filtered = n_total - n_organic
+        st.success(f"扫描到 **{len(tokens)}** 个 Trending Launchpad Token（共 {total_count} 条匹配）")
 
-    col1.metric("总样本", f"{n_total}")
-    col2.metric("通过 L1（#5 + #6）", f"{n_organic}", f"{n_organic/n_total*100:.0f}%")
-    col3.metric("被过滤", f"{n_filtered}", f"{n_filtered/n_total*100:.0f}%")
+        # Show raw scan results
+        with st.expander(f"Codex 原始结果（{len(tokens)} 个）"):
+            scan_data = []
+            for t in tokens[:50]:
+                tok = t["token"]
+                scan_data.append({
+                    "Symbol": tok.get("symbol", "?"),
+                    "MCap": f"${float(t.get('marketCap', 0) or 0):,.0f}",
+                    "Vol 4h": f"${float(t.get('volume4', 0) or 0):,.0f}",
+                    "Chg 4h": f"{float(t.get('change4', 0) or 0)*100:+.1f}%",
+                    "Holders": t.get("holders", 0),
+                    "Buy 4h": t.get("buyCount4", 0),
+                    "Sell 4h": t.get("sellCount4", 0),
+                    "Address": tok.get("address", "")[:16] + "...",
+                })
+            st.dataframe(pd.DataFrame(scan_data), hide_index=True, use_container_width=True)
 
-    # Cluster distribution
-    st.markdown("### 各 Cluster 分布")
-    dist_data = []
-    for rank in sorted(df["rank"].unique()):
-        meta = CLUSTER_META.get(rank, {})
-        n = len(df[df["rank"] == rank])
-        passed = "✅ 通过" if rank in [5, 6] else "❌ 过滤"
-        dist_data.append({
-            "#": rank,
-            "Cluster": meta.get("name", "?"),
-            "数量": n,
-            "占比": f"{n/n_total*100:.1f}%",
-            "L1 结果": passed,
-        })
-    st.dataframe(pd.DataFrame(dist_data), hide_index=True, use_container_width=True)
+        # L1 Classification
+        st.divider()
+        st.markdown("### Cluster 筛选结果")
 
-    st.divider()
+        progress = st.progress(0, text="正在对每个 token 进行 Cluster 分类...")
+        results = []
+        import time as _time
 
-    # Live test: input a token address
-    st.markdown("### 实时测试")
-    st.markdown("输入任意 token 地址，测试是否通过 L1 筛选。")
+        for i, t in enumerate(tokens):
+            tok = t["token"]
+            addr = tok.get("address", "")
+            sym = tok.get("symbol", "?")
 
-    test_addr = st.text_input("合约地址", placeholder="输入 Solana token 地址...", key="l1_test_addr")
+            progress.progress((i + 1) / len(tokens), text=f"分类中... {sym} ({i+1}/{len(tokens)})")
 
-    if test_addr and len(test_addr) > 20:
-        from baseline_cluster_v2 import build_feature_vector, compute_features
+            rank, feat = _classify_token_for_l1(addr, model)
+            _time.sleep(1.5)  # GMGN rate limit
 
-        with st.spinner("获取数据并计算特征..."):
-            feat = compute_features(test_addr.strip())
-            if feat is None:
-                try:
-                    from gmgn_api import fetch_token_data
-                    fetch_token_data("sol", test_addr.strip())
-                    feat = compute_features(test_addr.strip())
-                except Exception as e:
-                    st.error(f"获取失败: {e}")
+            meta = CLUSTER_META.get(rank, {}) if rank else {}
+            results.append({
+                "symbol": sym,
+                "address": addr,
+                "mcap": float(t.get("marketCap", 0) or 0),
+                "vol4h": float(t.get("volume4", 0) or 0),
+                "change4h": float(t.get("change4", 0) or 0),
+                "holders": t.get("holders", 0),
+                "buy4h": t.get("buyCount4", 0),
+                "sell4h": t.get("sellCount4", 0),
+                "cluster_rank": rank,
+                "cluster_name": meta.get("name", "无法分类"),
+                "passed": rank in [5, 6] if rank else False,
+                "ath": feat.get("ath", 0) if feat else 0,
+                "rise_hours": feat.get("rise_hours", 0) if feat else 0,
+            })
 
-        if feat is None:
-            st.warning("无法计算特征（数据不足或 ATH < $100K）")
-        else:
-            scaler = model["scaler"]
-            km = model["kmeans"]
-            cluster_order = model["cluster_order"]
-            rank_map = {c: i + 1 for i, c in enumerate(cluster_order)}
+        progress.empty()
 
-            vec = scaler.transform([build_feature_vector(feat)])
-            cid = int(km.predict(vec)[0])
-            rank = rank_map.get(cid, 0)
+        rdf = pd.DataFrame(results)
+        passed = rdf[rdf["passed"] == True]
+        filtered = rdf[rdf["passed"] == False]
+        unclassified = rdf[rdf["cluster_rank"].isna()]
+
+        # Funnel metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Codex 扫描", f"{len(rdf)}")
+        col2.metric("✅ 通过 L1", f"{len(passed)}", f"{len(passed)/max(len(rdf),1)*100:.0f}%")
+        col3.metric("❌ 过滤", f"{len(filtered)}")
+        col4.metric("⚠️ 无法分类", f"{len(unclassified)}")
+
+        # Funnel chart
+        funnel_data = []
+        for rank in sorted(rdf["cluster_rank"].dropna().unique()):
+            rank = int(rank)
             meta = CLUSTER_META.get(rank, {})
-            color = meta.get("color", "#888")
-            passed = rank in [5, 6]
+            n = len(rdf[rdf["cluster_rank"] == rank])
+            funnel_data.append({
+                "Cluster": f"#{rank} {meta.get('name', '?')}",
+                "数量": n,
+                "状态": "✅ 通过" if rank in [5, 6] else "❌ 过滤",
+            })
+        if funnel_data:
+            st.dataframe(pd.DataFrame(funnel_data), hide_index=True, use_container_width=True)
 
-            if passed:
-                st.success(f"✅ **通过 L1** → #{rank} {meta.get('name', '?')} — 进入 Candidate Pool")
-            else:
-                st.error(f"❌ **未通过 L1** → #{rank} {meta.get('name', '?')} — 被过滤")
+        # Passed tokens (candidates)
+        if len(passed) > 0:
+            st.markdown("### ✅ Candidate Pool（通过 L1）")
+            cand_data = []
+            for _, r in passed.sort_values("vol4h", ascending=False).iterrows():
+                cand_data.append({
+                    "Token": r["symbol"],
+                    "Cluster": f"#{int(r['cluster_rank'])} {r['cluster_name']}",
+                    "MCap": f"${r['mcap']:,.0f}",
+                    "Vol 4h": f"${r['vol4h']:,.0f}",
+                    "Chg 4h": f"{r['change4h']*100:+.1f}%",
+                    "Holders": r["holders"],
+                    "ATH": f"${r['ath']:,.0f}",
+                    "上升时长": f"{r['rise_hours']:.0f}h",
+                    "Address": r["address"][:20] + "...",
+                })
+            st.dataframe(pd.DataFrame(cand_data), hide_index=True, use_container_width=True)
+        else:
+            st.info("当前没有 token 通过 L1 筛选。")
 
-            st.markdown(f"""
-            | 指标 | 值 |
-            |---|---|
-            | Cluster | #{rank} {meta.get('name', '?')} |
-            | ATH | ${feat['ath']:,.0f} |
-            | 上升时长 | {feat['rise_hours']:.0f}h |
-            | 衰减时长 | {feat['decay_hours']:.0f}h |
-            | Holder@ATH | {feat['holders_at_ath']:,.0f} |
-            | 价格增速 | ${feat['price_roc']:,.0f}/h |
-            """)
-
-    st.divider()
-    st.markdown("### 后续步骤")
-    st.info("🚧 L2 进场信号（量化指标体系）和 L3 持仓监测将在下一阶段实现。")
+        # Filtered tokens
+        if len(filtered) > 0:
+            with st.expander(f"❌ 被过滤的 token（{len(filtered)} 个）"):
+                filt_data = []
+                for _, r in filtered.iterrows():
+                    filt_data.append({
+                        "Token": r["symbol"],
+                        "Cluster": f"#{int(r['cluster_rank'])} {r['cluster_name']}" if r["cluster_rank"] else "无法分类",
+                        "MCap": f"${r['mcap']:,.0f}",
+                        "Holders": r["holders"],
+                        "原因": r["cluster_name"],
+                    })
+                st.dataframe(pd.DataFrame(filt_data), hide_index=True, use_container_width=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
