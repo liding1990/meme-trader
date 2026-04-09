@@ -1187,18 +1187,22 @@ def section_candidate_monitor(df):
 
     table_rows = []
     for i, (_, r) in enumerate(edf.iterrows()):
+        raw = r.get("raw_score", r["entry_score"])
+        fresh = r.get("freshness", 1.0)
+        lifetime = r.get("lifetime_hours", 0)
         table_rows.append({
             "排名": i + 1,
             "Token": r["symbol"],
             "Entry Score": f"{r['entry_score']:.1f}",
-            "Regression (50%)": f"{r['s_regression']:.2f}",
+            "原始分": f"{raw:.1f}",
+            "新鲜度": f"{fresh:.0%}",
+            "Token Age": f"{lifetime:.0f}h" if lifetime else "",
+            "Reg (50%)": f"{r['s_regression']:.2f}",
             "动量 (15%)": f"{r['s_momentum']:.2f}",
             "放量 (15%)": f"{r['s_volume']:.2f}",
             "买压 (10%)": f"{r['s_buy']:.2f}",
             "Holder (10%)": f"{r['s_holder']:.2f}",
             "4h涨幅": f"{r['change4h']*100:+.1f}%",
-            "Vol 4h": f"${r['vol4h']:,.0f}",
-            "更新": r["updated_at"][:16] if r["updated_at"] else "",
         })
     st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
 

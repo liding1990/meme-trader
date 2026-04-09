@@ -131,6 +131,24 @@ def score_regression(composite_zscore):
     return min(max((composite_zscore + 1) / 2, 0), 1.0)
 
 
+def freshness_decay(lifetime_hours):
+    """Token age → 0.3-1.0 decay factor. Newer tokens get higher scores.
+
+    < 48h:    1.0 (full score)
+    48-168h:  linear decay to 0.7
+    168-720h: linear decay to 0.3
+    > 720h:   0.3 (floor)
+    """
+    if lifetime_hours <= 48:
+        return 1.0
+    elif lifetime_hours <= 168:
+        return 1.0 - (lifetime_hours - 48) / (168 - 48) * 0.3  # 1.0 → 0.7
+    elif lifetime_hours <= 720:
+        return 0.7 - (lifetime_hours - 168) / (720 - 168) * 0.4  # 0.7 → 0.3
+    else:
+        return 0.3
+
+
 def run_once():
     """Score all candidates for entry."""
     log.info("=" * 50)
@@ -166,7 +184,8 @@ def run_once():
 
     # Compute entry scores
     results = []
-    for c in candidates:
+    for _c in candidates:
+        c = dict(_c)  # convert sqlite3.Row to dict for .get()
         addr = c["address"]
         sym = c["symbol"]
         stats = all_stats.get(addr, {})
@@ -179,8 +198,8 @@ def run_once():
         s_buy = score_buy_pressure(stats.get("buyCount4", 0), stats.get("sellCount4", 0))
         s_holder = score_holder_momentum(stats.get("holders", 0), c["holders_at_discovery"])
 
-        # Weighted composite (0-100)
-        entry_score = (
+        # Weighted composite (0-100) with freshness decay
+        raw_score = (
             s_regression * W_REGRESSION +
             s_momentum * W_MOMENTUM +
             s_volume * W_VOLUME +
@@ -188,10 +207,17 @@ def run_once():
             s_holder * W_HOLDER_MOMENTUM
         ) * 100
 
+        lifetime = c.get("lifetime_hours", 0) or 0
+        decay = freshness_decay(lifetime)
+        entry_score = raw_score * decay
+
         results.append({
             "address": addr,
             "symbol": sym,
             "entry_score": round(entry_score, 1),
+            "raw_score": round(raw_score, 1),
+            "freshness": round(decay, 2),
+            "lifetime_hours": round(lifetime, 0),
             "s_regression": round(s_regression, 3),
             "s_momentum": round(s_momentum, 3),
             "s_volume": round(s_volume, 3),
@@ -214,6 +240,9 @@ def run_once():
             symbol TEXT,
             updated_at TEXT,
             entry_score REAL DEFAULT 0,
+            raw_score REAL DEFAULT 0,
+            freshness REAL DEFAULT 1,
+            lifetime_hours REAL DEFAULT 0,
             s_regression REAL DEFAULT 0,
             s_momentum REAL DEFAULT 0,
             s_volume REAL DEFAULT 0,
@@ -229,11 +258,12 @@ def run_once():
     for r in results:
         conn.execute("""
             INSERT OR REPLACE INTO entry_scores (
-                address, symbol, updated_at, entry_score,
+                address, symbol, updated_at, entry_score, raw_score, freshness, lifetime_hours,
                 s_regression, s_momentum, s_volume, s_buy, s_holder,
                 change4h, vol4h, holders, reg_z
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (r["address"], r["symbol"], now, r["entry_score"],
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (r["address"], r["symbol"], now, r["entry_score"], r["raw_score"],
+              r["freshness"], r["lifetime_hours"],
               r["s_regression"], r["s_momentum"], r["s_volume"],
               r["s_buy"], r["s_holder"],
               r["change4h"], r["vol4h"], r["holders"], r["reg_z"]))
