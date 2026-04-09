@@ -1193,6 +1193,7 @@ def section_candidate_monitor(df):
         table_rows.append({
             "排名": i + 1,
             "Token": r["symbol"],
+            "GMGN": f"https://gmgn.ai/sol/token/{r['address']}",
             "Entry Score": f"{r['entry_score']:.1f}",
             "原始分": f"{raw:.1f}",
             "新鲜度": f"{fresh:.0%}",
@@ -1204,7 +1205,9 @@ def section_candidate_monitor(df):
             "Holder (10%)": f"{r['s_holder']:.2f}",
             "4h涨幅": f"{r['change4h']*100:+.1f}%",
         })
-    st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
+    tdf = pd.DataFrame(table_rows)
+    st.dataframe(tdf, hide_index=True, use_container_width=True,
+                  column_config={"GMGN": st.column_config.LinkColumn("GMGN", display_text="Open")})
 
     # ── Top 10 Dimension Breakdown ──
     st.divider()
