@@ -377,6 +377,18 @@ def section_scatter(df):
     """2D 散点图。"""
     st.markdown("## 特征散点分析")
 
+    # Cluster filter — same level as X/Y
+    cluster_order = sorted(df["rank"].unique())
+    cluster_options = {f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}": r for r in cluster_order}
+
+    selected_clusters = st.multiselect(
+        "选择 Cluster",
+        list(cluster_options.keys()),
+        default=[k for k, v in cluster_options.items() if v in [5, 6]],
+        key="scatter_clusters",
+    )
+    selected_ranks = [cluster_options[s] for s in selected_clusters]
+
     col_x, col_y = st.columns(2)
     feature_options = {
         "ATH ($)": "ath",
@@ -388,27 +400,63 @@ def section_scatter(df):
         "总时长 (h)": "total_hours",
         "上升占比": "rise_pct",
         "Volume增速 ($/h)": "volume_roc",
+        "Holder衰减 (/h)": "holder_decay_roc",
+        "价格衰减 ($/h)": "price_decay_roc",
     }
-    x_label = col_x.selectbox("X 轴", list(feature_options.keys()), index=0, key="scatter_x")
-    y_label = col_y.selectbox("Y 轴", list(feature_options.keys()), index=4, key="scatter_y")
+    x_label = col_x.selectbox("X 轴", list(feature_options.keys()), index=3, key="scatter_x")
+    y_label = col_y.selectbox("Y 轴", list(feature_options.keys()), index=0, key="scatter_y")
     x_col = feature_options[x_label]
     y_col = feature_options[y_label]
 
-    plot_df = df.copy()
-    plot_df["cluster_name"] = plot_df["rank"].map(lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}")
-    color_map = {f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}": CLUSTER_META.get(r, {}).get("color", "#999")
-                 for r in sorted(df["rank"].unique())}
+    # Filter data
+    plot_df = df[df["rank"].isin(selected_ranks)].copy()
+    if plot_df.empty:
+        st.info("请选择至少一个 Cluster")
+        return
 
-    log_x = x_col in ("ath", "price_roc", "volume_roc", "rise_hours", "decay_hours", "total_hours")
-    log_y = y_col in ("ath", "price_roc", "volume_roc", "rise_hours", "decay_hours", "total_hours")
+    plot_df["cluster_name"] = plot_df["rank"].map(
+        lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}")
+    color_map = {f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}": CLUSTER_META.get(r, {}).get("color", "#999")
+                 for r in selected_ranks}
+
+    log_cols = {"ath", "price_roc", "volume_roc", "rise_hours", "decay_hours",
+                "total_hours", "holders_at_ath"}
+    log_x = x_col in log_cols
+    log_y = y_col in log_cols
+
+    # Handle negative values for log scale
+    if log_x:
+        plot_df = plot_df[plot_df[x_col] > 0]
+    if log_y:
+        plot_df = plot_df[plot_df[y_col] > 0]
 
     fig = px.scatter(plot_df, x=x_col, y=y_col, color="cluster_name",
                       hover_name="symbol", log_x=log_x, log_y=log_y,
                       color_discrete_map=color_map,
                       labels={x_col: x_label, y_col: y_label, "cluster_name": "Cluster"},
-                      title=f"{x_label} vs {y_label}")
-    fig.update_layout(height=500)
+                      title=f"{x_label} vs {y_label}（{len(plot_df)} tokens）")
+    fig.update_layout(height=550)
+    fig.update_traces(marker=dict(size=7, opacity=0.8))
     st.plotly_chart(fig, use_container_width=True)
+
+    # Per-cluster stats for selected
+    if len(selected_ranks) >= 2:
+        st.markdown("### 选中 Cluster 对比")
+        compare_rows = []
+        for r in selected_ranks:
+            sub = df[df["rank"] == r]
+            meta = CLUSTER_META.get(r, {})
+            compare_rows.append({
+                "Cluster": f"#{r} {meta.get('name', '?')}",
+                "数量": len(sub),
+                f"{x_label} 中位": f"{sub[x_col].median():,.1f}" if sub[x_col].median() < 1000
+                                  else f"${sub[x_col].median():,.0f}" if "($" in x_label
+                                  else f"{sub[x_col].median():,.0f}",
+                f"{y_label} 中位": f"{sub[y_col].median():,.1f}" if sub[y_col].median() < 1000
+                                  else f"${sub[y_col].median():,.0f}" if "($" in y_label
+                                  else f"{sub[y_col].median():,.0f}",
+            })
+        st.dataframe(pd.DataFrame(compare_rows), hide_index=True)
 
 
 def section_query(df, model):
