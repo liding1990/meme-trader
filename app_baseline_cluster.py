@@ -459,6 +459,119 @@ def section_scatter(df):
         st.dataframe(pd.DataFrame(compare_rows), hide_index=True)
 
 
+def section_regression(df):
+    """Regression 分析 — 针对 Organic cluster 的关键特征回归。"""
+    st.markdown("## Regression 分析")
+    st.markdown("针对 **#5 Organic Runner** 和 **#6 Fast Organic** 的关键特征对进行回归分析，发现增长规律。")
+
+    from scipy import stats as sp_stats
+
+    # Only organic clusters
+    organic = df[df["rank"].isin([5, 6])].copy()
+    organic["cluster_name"] = organic["rank"].map(
+        lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}")
+
+    # Predefined regression pairs
+    REGRESSION_PAIRS = [
+        ("volume_roc", "price_roc", "Volume增速 ($/h)", "价格增速 ($/h)"),
+        ("holder_roc", "ath", "Holder增速 (/h)", "ATH ($)"),
+        ("rise_hours", "ath", "上升时长 (h)", "ATH ($)"),
+        ("holders_at_ath", "ath", "Holder@ATH", "ATH ($)"),
+        ("volume_roc", "ath", "Volume增速 ($/h)", "ATH ($)"),
+        ("holder_roc", "price_roc", "Holder增速 (/h)", "价格增速 ($/h)"),
+    ]
+
+    pair_labels = [f"{x_label} vs {y_label}" for _, _, x_label, y_label in REGRESSION_PAIRS]
+    selected_pair = st.selectbox("选择分析维度", pair_labels, index=0, key="reg_pair")
+    pair_idx = pair_labels.index(selected_pair)
+    x_col, y_col, x_label, y_label = REGRESSION_PAIRS[pair_idx]
+
+    # Filter valid data (positive values for log)
+    plot_df = organic[(organic[x_col] > 0) & (organic[y_col] > 0)].copy()
+    if len(plot_df) < 5:
+        st.warning("有效数据点不足")
+        return
+
+    # Log-space regression
+    log_x = np.log10(plot_df[x_col].values)
+    log_y = np.log10(plot_df[y_col].values)
+    slope, intercept, r_value, p_value, std_err = sp_stats.linregress(log_x, log_y)
+    r_squared = r_value ** 2
+
+    # Regression line points
+    x_range = np.linspace(log_x.min(), log_x.max(), 100)
+    y_fit = slope * x_range + intercept
+
+    # Build chart
+    color_map = {
+        f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}": CLUSTER_META.get(r, {}).get("color", "#999")
+        for r in [5, 6]
+    }
+
+    fig = px.scatter(plot_df, x=x_col, y=y_col, color="cluster_name",
+                      hover_name="symbol", log_x=True, log_y=True,
+                      color_discrete_map=color_map,
+                      labels={x_col: x_label, y_col: y_label, "cluster_name": "Cluster"})
+
+    # Add regression line
+    fig.add_trace(go.Scatter(
+        x=10 ** x_range, y=10 ** y_fit,
+        mode="lines",
+        line=dict(color="#ef4444", width=3),
+        name=f"Regression (R²={r_squared:.3f})",
+        showlegend=True,
+    ))
+
+    fig.update_layout(
+        title=f"{x_label} vs {y_label}（{len(plot_df)} tokens, R²={r_squared:.3f}）",
+        height=550,
+    )
+    fig.update_traces(marker=dict(size=7, opacity=0.8), selector=dict(mode="markers"))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Regression stats
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("R²", f"{r_squared:.3f}")
+    col2.metric("斜率 (log-log)", f"{slope:.3f}")
+    col3.metric("p-value", f"{p_value:.2e}")
+    col4.metric("样本数", f"{len(plot_df)}")
+
+    # Interpretation
+    if r_squared > 0.5:
+        strength = "强"
+        emoji = "strong"
+    elif r_squared > 0.3:
+        strength = "中等"
+        emoji = "moderate"
+    else:
+        strength = "弱"
+        emoji = "weak"
+
+    st.markdown(f"""
+    ### 解读
+
+    **R² = {r_squared:.3f}** — {x_label} 和 {y_label} 之间存在 **{strength}** 的对数线性关系。
+
+    **斜率 = {slope:.3f}** — 在对数空间中，{x_label} 每增加 10 倍，{y_label} 大约增加 **{10**slope:.1f} 倍**。
+
+    **p-value = {p_value:.2e}** — {'统计显著（p < 0.05）' if p_value < 0.05 else '不显著（p >= 0.05）'}。
+    """)
+
+    # Per-cluster regression
+    st.markdown("### 分 Cluster 回归")
+    for rank in [5, 6]:
+        sub = plot_df[plot_df["rank"] == rank]
+        if len(sub) < 3:
+            continue
+        lx = np.log10(sub[x_col].values)
+        ly = np.log10(sub[y_col].values)
+        s, i, r, p, se = sp_stats.linregress(lx, ly)
+        meta = CLUSTER_META.get(rank, {})
+        st.markdown(f"- **#{rank} {meta.get('name', '?')}** ({len(sub)} tokens): "
+                    f"R²={r**2:.3f}, 斜率={s:.3f}, "
+                    f"{'显著' if p < 0.05 else '不显著'} (p={p:.2e})")
+
+
 def section_query(df, model):
     """Token 查询 — 支持数据集内 token 和任意外部 token 地址。"""
     st.markdown("## Token 查询")
@@ -634,6 +747,7 @@ with st.sidebar:
         "聚类结果",
         "3D 轨迹图",
         "散点分析",
+        "Regression 分析",
         "Token 查询",
     ], label_visibility="collapsed")
 
@@ -649,5 +763,7 @@ elif page == "3D 轨迹图":
     section_3d_chart(df)
 elif page == "散点分析":
     section_scatter(df)
+elif page == "Regression 分析":
+    section_regression(df)
 elif page == "Token 查询":
     section_query(df, model)
