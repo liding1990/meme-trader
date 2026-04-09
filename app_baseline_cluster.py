@@ -967,239 +967,148 @@ def section_query(df, model):
 # ── Token Discovery: L1 Cluster Filter ───────────────────────────────────────
 
 
-LAUNCHPADS = [
-    "Pump.fun", "Pump Mayhem", "Bonk", "Believe", "Moonshot",
-    "Jupiter Studio", "boop", "Heaven", "LaunchLab", "Moonit",
-    "TokenMill V2", "MeteoraDBC", "Zora Solana", "Cooking.City",
-    "Circus", "BAGS", "time.fun", "Dealr",
-]
-
-
-def _scan_trending_tokens():
-    """Scan Codex for trending launchpad tokens."""
-    import time as _time
-    from codex_api import _query
-
-    one_month_ago = int(_time.time()) - 30 * 86400
-    lp_list = ", ".join(f'"{lp}"' for lp in LAUNCHPADS)
-
-    query = f'''
-    query FilterTokens {{
-      filterTokens(
-        filters: {{
-          network: [1399811149]
-          marketCap: {{gte: 100000}}
-          holders: {{gte: 200}}
-          createdAt: {{gte: {one_month_ago}}}
-          launchpadName: [{lp_list}]
-          trendingIgnored: false
-          potentialScam: false
-        }}
-        statsType: FILTERED
-        rankings: [{{attribute: trendingScore4, direction: DESC}}]
-        limit: 200
-        offset: 0
-      ) {{
-        results {{
-          marketCap
-          holders
-          liquidity
-          volume4
-          volume24
-          change4
-          change24
-          buyCount4
-          sellCount4
-          uniqueBuys4
-          uniqueSells4
-          priceUSD
-          token {{
-            address
-            name
-            symbol
-            isScam
-          }}
-        }}
-        count
-      }}
-    }}
-    '''
-    result = _query(query)
-    ft = result.get("filterTokens", {})
-    return ft.get("results", []), ft.get("count", 0)
-
-
-def _classify_token_for_l1(address, model):
-    """Classify a token via GMGN data + KMeans model. Returns (rank, feat) or (None, None)."""
-    from baseline_cluster_v2 import build_feature_vector, compute_features
-    from gmgn_api import fetch_token_data
-
-    feat = compute_features(address)
-    if feat is None:
-        try:
-            fetch_token_data("sol", address)
-            feat = compute_features(address)
-        except Exception:
-            pass
-    if feat is None:
-        return None, None
-
-    scaler = model["scaler"]
-    km = model["kmeans"]
-    cluster_order = model["cluster_order"]
-    rank_map = {c: i + 1 for i, c in enumerate(cluster_order)}
-
-    vec = scaler.transform([build_feature_vector(feat)])
-    cid = int(km.predict(vec)[0])
-    rank = rank_map.get(cid, 0)
-    return rank, feat
-
-
 def section_l1_filter(df, model):
-    """L1 漏斗：Codex 实时扫描 + Cluster 筛选。"""
+    """L1 漏斗：展示 Pipeline 产出的 Candidate Pool。"""
+    from token_discovery import db as disc_db
+
+    disc_db.init_db()
+
     st.markdown("## L1: Cluster 筛选")
-
     st.markdown("""
-    **漏斗逻辑：** Codex 实时扫描 Trending Token → 获取 GMGN 历史数据 → 计算生命周期特征 → KMeans 预测 Cluster → 仅保留 #5 和 #6
-
-    ```
-    Codex Trending (4h, Solana launchpad, MCap>100K, Holders>200, age<30d, no scam)
-        ↓ 获取 GMGN 小时级数据
-        ↓ 计算 11 个生命周期特征
-        ↓ KMeans 预测 cluster
-        ↓ 仅保留 #5 Organic Runner 和 #6 Fast Organic
-    Candidate Pool
-    ```
+    **自动化 Pipeline** 每 15 分钟运行一次：Codex Trending 扫描 → GMGN 数据获取 → Cluster 分类 → 仅保留 #5 Organic Runner 和 #6 Fast Organic。
     """)
+    st.code("PYTHONPATH=. python -m token_discovery --loop", language="bash")
 
-    # Scan button
-    if st.button("🔍 扫描 Trending Token", type="primary", use_container_width=True):
-        with st.spinner("从 Codex 获取 Trending Token..."):
-            try:
-                tokens, total_count = _scan_trending_tokens()
-            except Exception as e:
-                st.error(f"Codex 扫描失败: {e}")
-                return
+    # ── Candidate Pool ──
+    candidates = disc_db.get_candidates()
+    pool_size = len(candidates)
 
-        if not tokens:
-            st.warning("未找到符合条件的 token")
-            return
+    st.markdown(f"### Candidate Pool（{pool_size} 个 token）")
 
-        st.success(f"扫描到 **{len(tokens)}** 个 Trending Launchpad Token（共 {total_count} 条匹配）")
+    if pool_size == 0:
+        st.info("Candidate Pool 为空。启动 Pipeline 后数据会自动填充。")
+    else:
+        # Metrics
+        cdf = pd.DataFrame([dict(c) for c in candidates])
 
-        # Show raw scan results
-        with st.expander(f"Codex 原始结果（{len(tokens)} 个）"):
-            scan_data = []
-            for t in tokens[:50]:
-                tok = t["token"]
-                scan_data.append({
-                    "Symbol": tok.get("symbol", "?"),
-                    "MCap": f"${float(t.get('marketCap', 0) or 0):,.0f}",
-                    "Vol 4h": f"${float(t.get('volume4', 0) or 0):,.0f}",
-                    "Chg 4h": f"{float(t.get('change4', 0) or 0)*100:+.1f}%",
-                    "Holders": t.get("holders", 0),
-                    "Buy 4h": t.get("buyCount4", 0),
-                    "Sell 4h": t.get("sellCount4", 0),
-                    "Address": tok.get("address", "")[:16] + "...",
-                })
-            st.dataframe(pd.DataFrame(scan_data), hide_index=True, use_container_width=True)
+        n_organic = len(cdf[cdf["cluster_rank"] == 5])
+        n_fast = len(cdf[cdf["cluster_rank"] == 6])
+        avg_mcap = cdf["mcap_at_discovery"].mean()
 
-        # L1 Classification
-        st.divider()
-        st.markdown("### Cluster 筛选结果")
-
-        progress = st.progress(0, text="正在对每个 token 进行 Cluster 分类...")
-        results = []
-        import time as _time
-
-        for i, t in enumerate(tokens):
-            tok = t["token"]
-            addr = tok.get("address", "")
-            sym = tok.get("symbol", "?")
-
-            progress.progress((i + 1) / len(tokens), text=f"分类中... {sym} ({i+1}/{len(tokens)})")
-
-            rank, feat = _classify_token_for_l1(addr, model)
-            _time.sleep(1.5)  # GMGN rate limit
-
-            meta = CLUSTER_META.get(rank, {}) if rank else {}
-            results.append({
-                "symbol": sym,
-                "address": addr,
-                "mcap": float(t.get("marketCap", 0) or 0),
-                "vol4h": float(t.get("volume4", 0) or 0),
-                "change4h": float(t.get("change4", 0) or 0),
-                "holders": t.get("holders", 0),
-                "buy4h": t.get("buyCount4", 0),
-                "sell4h": t.get("sellCount4", 0),
-                "cluster_rank": rank,
-                "cluster_name": meta.get("name", "无法分类"),
-                "passed": rank in [5, 6] if rank else False,
-                "ath": feat.get("ath", 0) if feat else 0,
-                "rise_hours": feat.get("rise_hours", 0) if feat else 0,
-            })
-
-        progress.empty()
-
-        rdf = pd.DataFrame(results)
-        passed = rdf[rdf["passed"] == True]
-        filtered = rdf[rdf["passed"] == False]
-        unclassified = rdf[rdf["cluster_rank"].isna()]
-
-        # Funnel metrics
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Codex 扫描", f"{len(rdf)}")
-        col2.metric("✅ 通过 L1", f"{len(passed)}", f"{len(passed)/max(len(rdf),1)*100:.0f}%")
-        col3.metric("❌ 过滤", f"{len(filtered)}")
-        col4.metric("⚠️ 无法分类", f"{len(unclassified)}")
+        col1.metric("总 Candidates", f"{pool_size}")
+        col2.metric("#5 Organic Runner", f"{n_organic}")
+        col3.metric("#6 Fast Organic", f"{n_fast}")
+        col4.metric("平均 MCap", f"${avg_mcap:,.0f}")
 
-        # Funnel chart
-        funnel_data = []
-        for rank in sorted(rdf["cluster_rank"].dropna().unique()):
-            rank = int(rank)
-            meta = CLUSTER_META.get(rank, {})
-            n = len(rdf[rdf["cluster_rank"] == rank])
-            funnel_data.append({
-                "Cluster": f"#{rank} {meta.get('name', '?')}",
-                "数量": n,
-                "状态": "✅ 通过" if rank in [5, 6] else "❌ 过滤",
+        # Table
+        table_data = []
+        for _, r in cdf.iterrows():
+            meta = CLUSTER_META.get(r["cluster_rank"], {})
+            table_data.append({
+                "Token": r["symbol"],
+                "Cluster": f"#{r['cluster_rank']} {meta.get('name', '?')}",
+                "发现时间": r["first_seen"][:16],
+                "MCap": f"${r['mcap_at_discovery']:,.0f}",
+                "Vol 4h": f"${r['vol4h_at_discovery']:,.0f}",
+                "Chg 4h": f"{r['change4h_at_discovery']*100:+.1f}%",
+                "Holders": r["holders_at_discovery"],
+                "ATH": f"${r['ath']:,.0f}",
+                "上升时长": f"{r['rise_hours']:.0f}h",
             })
-        if funnel_data:
-            st.dataframe(pd.DataFrame(funnel_data), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(table_data), hide_index=True, use_container_width=True)
 
-        # Passed tokens (candidates)
-        if len(passed) > 0:
-            st.markdown("### ✅ Candidate Pool（通过 L1）")
-            cand_data = []
-            for _, r in passed.sort_values("vol4h", ascending=False).iterrows():
-                cand_data.append({
-                    "Token": r["symbol"],
-                    "Cluster": f"#{int(r['cluster_rank'])} {r['cluster_name']}",
-                    "MCap": f"${r['mcap']:,.0f}",
-                    "Vol 4h": f"${r['vol4h']:,.0f}",
-                    "Chg 4h": f"{r['change4h']*100:+.1f}%",
-                    "Holders": r["holders"],
-                    "ATH": f"${r['ath']:,.0f}",
-                    "上升时长": f"{r['rise_hours']:.0f}h",
-                    "Address": r["address"][:20] + "...",
-                })
-            st.dataframe(pd.DataFrame(cand_data), hide_index=True, use_container_width=True)
-        else:
-            st.info("当前没有 token 通过 L1 筛选。")
+        # ── 3D Scatter ──
+        st.markdown("### 3D 可视化")
+        st.markdown("*每个点 = 一个 candidate 在被发现时的状态。*")
 
-        # Filtered tokens
-        if len(filtered) > 0:
-            with st.expander(f"❌ 被过滤的 token（{len(filtered)} 个）"):
-                filt_data = []
-                for _, r in filtered.iterrows():
-                    filt_data.append({
-                        "Token": r["symbol"],
-                        "Cluster": f"#{int(r['cluster_rank'])} {r['cluster_name']}" if pd.notna(r["cluster_rank"]) else "无法分类",
-                        "MCap": f"${r['mcap']:,.0f}",
-                        "Holders": r["holders"],
-                        "原因": r["cluster_name"],
+        color_map = {5: "#22c55e", 6: "#3b82f6"}
+        cdf["color"] = cdf["cluster_rank"].map(color_map)
+        cdf["cluster_label"] = cdf["cluster_rank"].map(
+            lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}"
+        )
+
+        fig = go.Figure()
+        for rank in [5, 6]:
+            sub = cdf[cdf["cluster_rank"] == rank]
+            if sub.empty:
+                continue
+            meta = CLUSTER_META.get(rank, {})
+            fig.add_trace(go.Scatter3d(
+                x=sub["mcap_at_discovery"],
+                y=sub["holders_at_discovery"],
+                z=sub["vol4h_at_discovery"],
+                mode="markers",
+                marker=dict(size=6, color=color_map[rank], opacity=0.8),
+                text=[
+                    f"<b>{r['symbol']}</b><br>"
+                    f"#{r['cluster_rank']} {meta.get('name', '?')}<br>"
+                    f"MCap: ${r['mcap_at_discovery']:,.0f}<br>"
+                    f"Holders: {r['holders_at_discovery']:,}<br>"
+                    f"Vol 4h: ${r['vol4h_at_discovery']:,.0f}<br>"
+                    f"发现: {r['first_seen'][:16]}"
+                    for _, r in sub.iterrows()
+                ],
+                hoverinfo="text",
+                name=f"#{rank} {meta.get('name', '?')} ({len(sub)})",
+            ))
+
+        fig.update_layout(
+            scene=dict(
+                xaxis_title="MCap at Discovery ($)",
+                yaxis_title="Holders",
+                zaxis_title="Volume 4h ($)",
+                xaxis=dict(type="log", backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+                yaxis=dict(type="log", backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+                zaxis=dict(type="log", backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+                bgcolor="white",
+            ),
+            paper_bgcolor="white",
+            font=dict(color="black"),
+            height=600,
+            margin=dict(l=0, r=0, t=10, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Pipeline Logs ──
+    st.divider()
+    st.markdown("### Pipeline 运行日志")
+
+    logs = disc_db.get_scan_logs(limit=20)
+    if logs:
+        log_data = []
+        for l in logs:
+            log_data.append({
+                "时间": l["timestamp"][:19],
+                "Codex 扫描": l["codex_count"],
+                "GMGN 获取": l["gmgn_fetched"],
+                "已分类": l["classified"],
+                "新增 Candidate": l["new_candidates"],
+                "Pool 总量": l["total_pool"],
+            })
+        st.dataframe(pd.DataFrame(log_data), hide_index=True, use_container_width=True)
+
+        # Expandable: latest scan token details
+        latest = logs[0]
+        details = json.loads(latest["token_details"]) if latest["token_details"] else []
+        if details:
+            with st.expander(f"最近一次扫描详情（{latest['timestamp'][:19]}，{len(details)} tokens）"):
+                det_data = []
+                for d in details:
+                    passed = "✅" if d.get("passed_l1") else "❌"
+                    new = "🆕" if d.get("is_new") else ""
+                    det_data.append({
+                        "": f"{passed} {new}",
+                        "Token": d.get("symbol", "?"),
+                        "Cluster": f"#{d['cluster_rank']} {d['cluster_name']}" if d.get("cluster_rank") else "无法分类",
+                        "MCap": f"${d.get('mcap', 0):,.0f}",
+                        "Holders": d.get("holders", 0),
+                        "Vol 4h": f"${d.get('vol4h', 0):,.0f}",
+                        "ATH": f"${d.get('ath', 0):,.0f}" if d.get("ath") else "N/A",
                     })
-                st.dataframe(pd.DataFrame(filt_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(det_data), hide_index=True, use_container_width=True)
+    else:
+        st.info("暂无运行日志。启动 Pipeline 后自动生成。")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
