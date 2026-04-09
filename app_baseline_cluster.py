@@ -802,54 +802,6 @@ def _render_regression_position(df, feat, symbol, rank):
         st.markdown(f"{interpretation}")
         st.divider()
 
-    # Summary z-score card
-    if z_scores:
-        st.markdown("### Organic Quality Score 综合评分")
-        avg_z = np.mean([z for _, z in z_scores])
-
-        if avg_z > 0.5:
-            overall = "优秀"
-            overall_color = "#22c55e"
-            overall_desc = "该 token 在多数维度上超越 organic 回归预期，社区质量和增长动能优秀。"
-        elif avg_z > 0:
-            overall = "良好"
-            overall_color = "#3b82f6"
-            overall_desc = "该 token 整体表现在 organic 回归线附近或略上方，属于正常偏好。"
-        elif avg_z > -0.5:
-            overall = "一般"
-            overall_color = "#f59e0b"
-            overall_desc = "该 token 在部分维度低于预期，需要持续观察是否有改善趋势。"
-        else:
-            overall = "较差"
-            overall_color = "#ef4444"
-            overall_desc = "该 token 多数维度低于 organic 回归预期，增长质量存疑。"
-
-        col_score, col_detail = st.columns([1, 2])
-        with col_score:
-            st.markdown(f"""
-            <div style="text-align:center; padding:20px; background:{overall_color}10;
-                        border:2px solid {overall_color}; border-radius:12px;">
-                <div style="font-size:3em; font-weight:bold; color:{overall_color};">{avg_z:+.2f}</div>
-                <div style="font-size:1.2em; color:{overall_color};">{overall}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with col_detail:
-            st.markdown(f"**{overall_desc}**")
-            st.markdown("各维度 z-score：")
-            for name, z in z_scores:
-                bar_width = min(abs(z) * 30, 100)
-                bar_color = "#22c55e" if z > 0 else "#ef4444"
-                direction = "+" if z > 0 else ""
-                st.markdown(
-                    f'<div style="margin:4px 0;">'
-                    f'<span style="display:inline-block; width:120px;">{name}</span>'
-                    f'<span style="display:inline-block; width:50px; text-align:right; font-weight:bold; color:{bar_color};">{direction}{z:.2f}</span>'
-                    f'<span style="display:inline-block; width:{bar_width}px; height:12px; '
-                    f'background:{bar_color}; border-radius:6px; margin-left:8px; vertical-align:middle;"></span>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
 
 
 def section_query(df, model):
