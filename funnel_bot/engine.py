@@ -105,7 +105,11 @@ BAR_CACHE_TTL = 600  # 10 min
 
 
 def fetch_recent_bars(address):
-    """Fetch recent hourly candles from GMGN + compute arrays."""
+    """Fetch recent hourly candles from GMGN + compute arrays.
+
+    Returns dict with mcap array (from candle close = market cap),
+    volume, HMM states, and current_mcap (latest candle close).
+    """
     now = time.time()
     if address in _bar_cache and now - _bar_cache[address]["ts"] < BAR_CACHE_TTL:
         return _bar_cache[address]
@@ -123,6 +127,7 @@ def fetch_recent_bars(address):
 
         mcap = df["mcap"].values
         volume = df["volume"].values
+        current_mcap = float(mcap[-1])  # latest candle close = current mcap
 
         # HMM precompute
         hmm_s, hmm_d, hmm_t = precompute_hmm_for_token(mcap)
@@ -131,12 +136,13 @@ def fetch_recent_bars(address):
             "ts": now,
             "mcap": mcap,
             "volume": volume,
-            "holders": np.zeros(len(mcap)),  # no real-time holder data
+            "holders": np.zeros(len(mcap)),
             "top10": np.full(len(mcap), np.nan),
             "hmm_s": hmm_s,
             "hmm_d": hmm_d,
             "hmm_t": hmm_t,
             "n": len(mcap),
+            "current_mcap": current_mcap,  # reliable mcap from candle data
         }
         _bar_cache[address] = result
         return result
@@ -303,11 +309,15 @@ def run():
                 bars = pos["bars_held"] + 1
                 realized = pos["realized_pnl"]
 
-                price_data = get_token_price(addr)
-                if price_data is None:
-                    continue
-
-                current = price_data.get("market_cap", 0) or price_data.get("price", 0)
+                # Get current mcap from bars (reliable)
+                bar_data = fetch_recent_bars(addr)
+                if bar_data and bar_data.get("current_mcap", 0) > 0:
+                    current = bar_data["current_mcap"]
+                else:
+                    price_data = get_token_price(addr)
+                    if price_data is None:
+                        continue
+                    current = price_data.get("market_cap", 0) or price_data.get("price", 0)
                 if current <= 0:
                     continue
 
@@ -365,12 +375,19 @@ def run():
                     if capital < POSITION_SIZE:
                         break
 
-                    price_data = get_token_price(addr)
-                    if price_data is None:
-                        continue
-                    mcap = price_data.get("market_cap", 0) or price_data.get("price", 0)
-                    if mcap <= 0:
-                        continue
+                    # Get mcap from bar data (reliable) or fallback to price API
+                    bars = fetch_recent_bars(addr)
+                    if bars and bars.get("current_mcap", 0) > 0:
+                        mcap = bars["current_mcap"]
+                    else:
+                        price_data = get_token_price(addr)
+                        if price_data is None:
+                            continue
+                        mcap = price_data.get("market_cap", 0)
+                        if mcap <= 0:
+                            mcap = price_data.get("price", 0)  # token price as last resort
+                        if mcap <= 0:
+                            continue
 
                     capital -= POSITION_SIZE
                     trade_id = db.open_position(addr, item["symbol"], mcap, POSITION_SIZE,
