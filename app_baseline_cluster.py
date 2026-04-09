@@ -1080,23 +1080,45 @@ if df is None:
     st.error("聚类数据未找到。请先运行 `python baseline_cluster_v2.py`。")
     st.stop()
 
-# Single unified navigation — one radio group with section headers outside
-CLUSTER_PAGES = ["数据方法论", "聚类结果", "3D 轨迹图", "散点分析", "Regression 分析", "Token 查询"]
-DISCOVERY_PAGES = ["L1: Cluster 筛选"]
-ALL_PAGES = CLUSTER_PAGES + DISCOVERY_PAGES
+# Navigation via styled buttons as menu items
+MENU = {
+    "Baseline Cluster v2": {
+        "caption": f"{len(df)} tokens · 6 clusters · 2026年后",
+        "pages": ["数据方法论", "聚类结果", "3D 轨迹图", "散点分析", "Regression 分析", "Token 查询"],
+    },
+    "Token Discovery": {
+        "caption": "漏斗筛选 → 量化信号 → 进场",
+        "pages": ["L1: Cluster 筛选"],
+    },
+}
+
+if "page" not in st.session_state:
+    st.session_state.page = "数据方法论"
 
 with st.sidebar:
     st.title("Meme Trading System")
-    st.divider()
-    st.markdown("##### Baseline Cluster v2")
-    st.caption(f"{len(df)} tokens · 6 clusters · 2026年后")
-    st.markdown("##### Token Discovery")
-    st.caption("漏斗筛选 → 量化信号 → 进场")
-    st.divider()
 
-    page = st.radio("导航", ALL_PAGES, label_visibility="collapsed", key="main_nav")
+    for section, info in MENU.items():
+        st.divider()
+        st.markdown(f"**{section}**")
+        st.caption(info["caption"])
+        for p in info["pages"]:
+            is_active = st.session_state.page == p
+            if st.button(
+                f"{'▸ ' if is_active else '　'}{p}",
+                key=f"menu_{p}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state.page = p
+                st.rerun()
+
+page = st.session_state.page
 
 # Content routing
+CLUSTER_PAGES = MENU["Baseline Cluster v2"]["pages"]
+DISCOVERY_PAGES = MENU["Token Discovery"]["pages"]
+
 if page in CLUSTER_PAGES:
     st.title("Baseline Clustering v2")
     st.caption("基于结果特征的 Memecoin 生命周期聚类 | 500 tokens · 6 clusters · 11 features")
