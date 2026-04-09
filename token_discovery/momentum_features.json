@@ -1,0 +1,1 @@
+["roc_1h", "roc_4h", "roc_12h", "volatility_4h", "volatility_12h", "volume_trend", "volume_surge", "volume_concentration", "holder_growth_1h", "holder_growth_4h", "holder_acceleration", "price_vs_vwap", "drawdown_from_peak", "pct_of_ath", "mcap_per_holder", "mcap_level", "holders_level", "price_position", "trend_slope", "ma_deviation"]
