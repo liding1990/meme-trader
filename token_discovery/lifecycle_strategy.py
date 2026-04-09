@@ -193,6 +193,14 @@ def run_lifecycle_strategy(mcap, volume, holders):
 
         action = None
 
+        # Adaptive thresholds: during first 36h, require stronger signals
+        # (holder data is naturally noisy during launch)
+        early_phase = t < 24
+        decline_6h = 8 if early_phase else 6     # require 8h decline in early, 6h later
+        decline_12h = 15 if early_phase else 12  # require 15h in early, 12h later
+        decline_exit = 28 if early_phase else 24 # require 28h in early, 24h later
+        stagnant_profit = 0.70 if early_phase else 0.50
+
         # Rule 6: Rug protection — deep drawdown + holder declining
         if drawdown_from_peak < -0.70 and not signals["holder_growing"]:
             sell = remaining
@@ -200,29 +208,29 @@ def run_lifecycle_strategy(mcap, volume, holders):
             action = "EXIT(rug)"
             remaining = 0
 
-        # Rule 5: Holder declining 24+ hours → EXIT
-        elif signals["declining_hours"] >= 24 and remaining > 0:
+        # Rule 5: Holder declining → EXIT
+        elif signals["declining_hours"] >= decline_exit and remaining > 0:
             sell = remaining
             realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-            action = "EXIT(24h decline)"
+            action = "EXIT(decline)"
             remaining = 0
 
-        # Rule 4: Holder declining 12+ hours + volume shrinking → TP 40%
-        elif signals["declining_hours"] >= 12 and signals["volume_trend"] < 0.5:
+        # Rule 4: Holder declining + volume shrinking → TP 40%
+        elif signals["declining_hours"] >= decline_12h and signals["volume_trend"] < 0.5:
             sell = min(0.40, remaining)
             realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
             remaining -= sell
-            action = "TP40%(12h+vol)"
+            action = "TP40%(decline+vol)"
 
-        # Rule 3: Holder declining 6+ consecutive hours → TP 25%
-        elif signals["declining_hours"] >= 6:
+        # Rule 3: Holder declining → TP 25%
+        elif signals["declining_hours"] >= decline_6h:
             sell = min(0.25, remaining)
             realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
             remaining -= sell
-            action = "TP25%(6h decline)"
+            action = "TP25%(decline)"
 
         # Rule 2: Holder stagnating + profit → TP 20%
-        elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.50:
+        elif abs(signals["holder_trend"]) < 0.001 and pnl > stagnant_profit:
             sell = min(0.20, remaining)
             realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
             remaining -= sell
