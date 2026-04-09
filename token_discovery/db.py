@@ -46,6 +46,26 @@ def init_db():
         status TEXT DEFAULT 'active'
     );
 
+    CREATE TABLE IF NOT EXISTS candidate_scores (
+        address TEXT PRIMARY KEY,
+        symbol TEXT,
+        updated_at TEXT,
+        current_mcap REAL DEFAULT 0,
+        current_holders REAL DEFAULT 0,
+        current_ath REAL DEFAULT 0,
+        current_rise_hours REAL DEFAULT 0,
+        current_price_roc REAL DEFAULT 0,
+        current_volume_roc REAL DEFAULT 0,
+        current_holder_roc REAL DEFAULT 0,
+        current_holders_at_ath REAL DEFAULT 0,
+        z_holder_efficiency REAL DEFAULT 0,
+        z_volume_authenticity REAL DEFAULT 0,
+        z_mcap_sustainability REAL DEFAULT 0,
+        z_price_community REAL DEFAULT 0,
+        z_growth_ceiling REAL DEFAULT 0,
+        composite_score REAL DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS scan_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
@@ -118,6 +138,39 @@ def log_scan(codex_count, gmgn_fetched, classified, new_candidates, total_pool, 
     )
     conn.commit()
     conn.close()
+
+
+def upsert_score(address, symbol, current_mcap, current_holders, current_ath,
+                  current_rise_hours, current_price_roc, current_volume_roc,
+                  current_holder_roc, current_holders_at_ath,
+                  z_holder_efficiency, z_volume_authenticity, z_mcap_sustainability,
+                  z_price_community, z_growth_ceiling, composite_score):
+    conn = get_conn()
+    conn.execute("""
+        INSERT OR REPLACE INTO candidate_scores (
+            address, symbol, updated_at, current_mcap, current_holders,
+            current_ath, current_rise_hours, current_price_roc, current_volume_roc,
+            current_holder_roc, current_holders_at_ath,
+            z_holder_efficiency, z_volume_authenticity, z_mcap_sustainability,
+            z_price_community, z_growth_ceiling, composite_score
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (address, symbol, datetime.now(timezone.utc).isoformat(),
+          current_mcap, current_holders, current_ath,
+          current_rise_hours, current_price_roc, current_volume_roc,
+          current_holder_roc, current_holders_at_ath,
+          z_holder_efficiency, z_volume_authenticity, z_mcap_sustainability,
+          z_price_community, z_growth_ceiling, composite_score))
+    conn.commit()
+    conn.close()
+
+
+def get_scores():
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM candidate_scores ORDER BY composite_score DESC"
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def get_scan_logs(limit=50):

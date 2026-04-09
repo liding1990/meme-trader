@@ -1124,6 +1124,117 @@ if df is None:
     st.error("聚类数据未找到。请先运行 `python baseline_cluster_v2.py`。")
     st.stop()
 
+MONITOR_REGRESSION_PAIRS = [
+    ("volume_roc", "holder_roc", "Volume增速 ($/h)", "Holder增速 (/h)", "holder吸引效率", "z_holder_efficiency"),
+    ("price_roc", "volume_roc", "价格增速 ($/h)", "Volume增速 ($/h)", "成交量真实性", "z_volume_authenticity"),
+    ("ath", "holders_at_ath", "ATH ($)", "Holder@ATH", "市值可持续性", "z_mcap_sustainability"),
+    ("price_roc", "holder_roc", "价格增速 ($/h)", "Holder增速 (/h)", "价格-社区联动", "z_price_community"),
+    ("holder_roc", "holders_at_ath", "Holder增速 (/h)", "Holder@ATH", "增长天花板", "z_growth_ceiling"),
+]
+
+
+def section_candidate_monitor(df):
+    """Candidate Monitor — regression-based scoring of pool tokens."""
+    from token_discovery import db as disc_db
+    disc_db.init_db()
+
+    st.markdown("## Candidate Monitor")
+    st.markdown("基于 Regression 分析对 Candidate Pool 中的 token 实时评分排序。每小时自动更新。")
+    st.code("PYTHONPATH=. python -m token_discovery.monitor --loop", language="bash")
+
+    scores = disc_db.get_scores()
+
+    if not scores:
+        st.info("暂无评分数据。运行 `PYTHONPATH=. python -m token_discovery.monitor` 生成。")
+        return
+
+    sdf = pd.DataFrame([dict(s) for s in scores])
+
+    # ── Ranked Table ──
+    st.markdown(f"### 评分排名（{len(sdf)} 个 Candidate）")
+
+    rank_data = []
+    for i, (_, r) in enumerate(sdf.iterrows()):
+        zs = {
+            "holder吸引效率": r["z_holder_efficiency"],
+            "成交量真实性": r["z_volume_authenticity"],
+            "市值可持续性": r["z_mcap_sustainability"],
+            "价格-社区联动": r["z_price_community"],
+            "增长天花板": r["z_growth_ceiling"],
+        }
+        best_dim = max(zs, key=zs.get)
+        worst_dim = min(zs, key=zs.get)
+
+        rank_data.append({
+            "排名": i + 1,
+            "Token": r["symbol"],
+            "综合分": f"{r['composite_score']:+.2f}",
+            "ATH": f"${r['current_ath']:,.0f}",
+            "Holders": f"{r['current_holders']:,.0f}",
+            "上升时长": f"{r['current_rise_hours']:.0f}h",
+            "最强维度": f"{best_dim} ({zs[best_dim]:+.2f})",
+            "最弱维度": f"{worst_dim} ({zs[worst_dim]:+.2f})",
+            "更新": r["updated_at"][:16],
+        })
+    st.dataframe(pd.DataFrame(rank_data), hide_index=True, use_container_width=True)
+
+    # ── Regression Plots ──
+    st.divider()
+    st.markdown("### Regression 维度分析")
+    st.markdown("*灰色 = 历史 baseline，彩色 = 当前 candidate（绿>0.3, 黄中间, 红<-0.3）*")
+
+    organic = df[df["rank"].isin([5, 6])].copy()
+
+    for x_col, y_col, x_label, y_label, dim_name, z_col in MONITOR_REGRESSION_PAIRS:
+        sub = organic[(organic[x_col] > 0) & (organic[y_col] > 0)]
+        if len(sub) < 10:
+            continue
+
+        log_x = np.log10(sub[x_col].values)
+        log_y = np.log10(sub[y_col].values)
+        coeffs = np.polyfit(log_x, log_y, 2)
+        poly = np.poly1d(coeffs)
+        x_range = np.linspace(log_x.min() - 0.3, log_x.max() + 0.3, 200)
+        y_fit = poly(x_range)
+        residual_std = np.std(log_y - poly(log_x))
+
+        col_map = {
+            "volume_roc": "current_volume_roc", "price_roc": "current_price_roc",
+            "holder_roc": "current_holder_roc", "ath": "current_ath",
+            "holders_at_ath": "current_holders_at_ath",
+        }
+        sx, sy = col_map.get(x_col, x_col), col_map.get(y_col, y_col)
+        valid = sdf[(sdf[sx] > 0) & (sdf[sy] > 0)].copy()
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=sub[x_col], y=sub[y_col], mode="markers",
+                                  marker=dict(size=4, color="#d1d5db", opacity=0.4),
+                                  name="Baseline", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=10**x_range, y=10**y_fit, mode="lines",
+                                  line=dict(color="#ef4444", width=2), name="回归线"))
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([10**x_range, 10**x_range[::-1]]),
+            y=np.concatenate([10**(y_fit+residual_std), 10**(y_fit-residual_std)[::-1]]),
+            fill="toself", fillcolor="rgba(239,68,68,0.06)",
+            line=dict(color="rgba(0,0,0,0)"), showlegend=False))
+
+        if len(valid) > 0:
+            colors = ["#22c55e" if z > 0.3 else "#ef4444" if z < -0.3 else "#f59e0b"
+                       for z in valid[z_col]]
+            fig.add_trace(go.Scatter(
+                x=valid[sx], y=valid[sy], mode="markers+text",
+                marker=dict(size=10, color=colors, line=dict(width=1, color="white")),
+                text=valid["symbol"], textposition="top center", textfont=dict(size=9),
+                hovertext=[f"<b>{r['symbol']}</b><br>z={r[z_col]:+.2f}" for _, r in valid.iterrows()],
+                hoverinfo="text", name="Candidates"))
+
+        fig.update_layout(title=f"{dim_name}: {x_label} vs {y_label}",
+                           xaxis_title=x_label, yaxis_title=y_label,
+                           xaxis_type="log", yaxis_type="log",
+                           height=400, margin=dict(l=50, r=20, t=40, b=40))
+        st.plotly_chart(fig, use_container_width=True)
+
+
 # Navigation via styled buttons as menu items
 MENU = {
     "Baseline Cluster v2": {
@@ -1132,7 +1243,7 @@ MENU = {
     },
     "Token Discovery": {
         "caption": "漏斗筛选 → 量化信号 → 进场",
-        "pages": ["L1: Cluster 筛选"],
+        "pages": ["L1: Cluster 筛选", "Candidate Monitor"],
     },
 }
 
@@ -1209,3 +1320,5 @@ elif page in DISCOVERY_PAGES:
 
     if page == "L1: Cluster 筛选":
         section_l1_filter(df, model)
+    elif page == "Candidate Monitor":
+        section_candidate_monitor(df)
