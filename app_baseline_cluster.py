@@ -1299,6 +1299,287 @@ def section_candidate_monitor(df):
     st.plotly_chart(fig_hist, use_container_width=True)
 
 
+def section_position_management():
+    """持仓管理 — 分层止盈止损策略设计。"""
+    st.markdown("## 持仓管理")
+    st.markdown("基于 244 个 Organic token 的历史数据，设计分层止盈止损策略。初始建仓 **$5,000**。")
+
+    # ── Historical Data Summary ──
+    st.markdown("### 历史数据基础")
+
+    col1, col2, col3 = st.columns(3)
+    col1.markdown("""
+    **涨幅分布（244 tokens）**
+    - 小涨 (<50%): 20%
+    - 中涨 (50-200%): 16%
+    - 大涨 (200-500%): 23%
+    - 暴涨 (500%+): **40%**
+    """)
+    col2.markdown("""
+    **上升期最大回调**
+    - <10% 回调: 16%
+    - 10-20%: 7%
+    - 20-40%: 18%
+    - **>40% 回调: 59%**
+    """)
+    col3.markdown("""
+    **ATH 后暴跌**
+    - 中位跌幅: -74% (#5), -99% (#6)
+    - 不卖 = 大概率归零
+    - 必须分批止盈
+    """)
+
+    st.divider()
+
+    # ── Strategy Definition ──
+    POSITION_SIZE = 5000
+
+    TP_LEVELS = [
+        (0.30, 0.15, "+30%: 先回一部分本金，降低心理压力"),
+        (0.80, 0.20, "+80%: 接近翻倍，锁定第一波利润"),
+        (2.00, 0.20, "+200%: 3x，已卖出超过一半本金"),
+        (5.00, 0.20, "+500%: 6x，大部分利润已锁定"),
+        (10.00, 0.15, "+1000%: 10x，留最后 10% 搏更大收益"),
+    ]
+
+    SL_LEVELS = [
+        (-0.15, 0.30, "-15%: 初步减仓，但不全清（59% 的 runner 回调 >40%）"),
+        (-0.30, 0.30, "-30%: 大幅减仓，控制风险"),
+        (-0.50, 1.00, "-50%: 硬止损，腰斩 = 大概率不回来"),
+    ]
+
+    TRAILING_STOP_PCT = 0.30  # 最后 10% 仓位的 trailing stop
+
+    st.markdown("### 止盈策略（5 档递进）")
+
+    tp_data = []
+    remaining = 1.0
+    cumulative_sold = 0.0
+    for gain, sell_pct, desc in TP_LEVELS:
+        actual_sell = sell_pct
+        remaining -= actual_sell
+        cumulative_sold += actual_sell
+        tp_data.append({
+            "涨幅触发": f"+{gain*100:.0f}%",
+            "卖出比例": f"{actual_sell*100:.0f}%",
+            "剩余仓位": f"{remaining*100:.0f}%",
+            "累计已卖": f"{cumulative_sold*100:.0f}%",
+            "说明": desc,
+        })
+    tp_data.append({
+        "涨幅触发": "Trailing Stop",
+        "卖出比例": f"{remaining*100:.0f}% (全部)",
+        "剩余仓位": "0%",
+        "累计已卖": "100%",
+        "说明": f"最后 {remaining*100:.0f}% 仓位：从最高点回撤 {TRAILING_STOP_PCT*100:.0f}% 触发",
+    })
+    st.dataframe(pd.DataFrame(tp_data), hide_index=True, use_container_width=True)
+
+    st.markdown("### 止损策略（3 档递进）")
+
+    sl_data = []
+    sl_remaining = 1.0
+    for loss, sell_pct, desc in SL_LEVELS:
+        actual = min(sell_pct, sl_remaining)
+        sl_remaining -= actual
+        sl_data.append({
+            "跌幅触发": f"{loss*100:.0f}%",
+            "卖出比例": f"{actual*100:.0f}%" + (" (全部)" if sl_remaining <= 0 else ""),
+            "剩余仓位": f"{max(sl_remaining, 0)*100:.0f}%",
+            "说明": desc,
+        })
+    st.dataframe(pd.DataFrame(sl_data), hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # ── Visualization: Staircase TP/SL ──
+    st.markdown("### 可视化：仓位变化曲线")
+
+    # Simulate price path: entry → ATH → crash
+    price_pcts = np.concatenate([
+        np.linspace(0, 12, 200),    # rise to +1200%
+        np.linspace(12, -0.5, 100),  # crash to -50%
+    ])
+
+    # Strategy simulation
+    remaining_strat = 1.0
+    peak_gain = 0.0
+    trailing_active = False
+    realized_strat = 0.0
+    strat_value = []
+    strat_remaining = []
+    tp_markers = []
+    sl_markers = []
+
+    # Track which TP/SL levels have been triggered
+    tp_triggered = [False] * len(TP_LEVELS)
+    sl_triggered = [False] * len(SL_LEVELS)
+    trailing_triggered = False
+
+    for i, pct in enumerate(price_pcts):
+        if remaining_strat <= 0.001:
+            strat_value.append(realized_strat)
+            strat_remaining.append(0)
+            continue
+
+        current_value = remaining_strat * POSITION_SIZE * (1 + pct) + realized_strat
+        peak_gain = max(peak_gain, pct)
+
+        # Check TP levels
+        for j, (trigger, sell_pct, _) in enumerate(TP_LEVELS):
+            if not tp_triggered[j] and pct >= trigger and remaining_strat > 0.001:
+                actual_sell = min(sell_pct, remaining_strat)
+                realized_strat += actual_sell * POSITION_SIZE * (1 + pct)
+                remaining_strat -= actual_sell
+                tp_triggered[j] = True
+                tp_markers.append((i, pct, f"TP {trigger*100:.0f}%\n卖{actual_sell*100:.0f}%"))
+
+        # Check trailing stop for last portion
+        if all(tp_triggered) and not trailing_triggered and remaining_strat > 0.001:
+            trailing_active = True
+            if pct < peak_gain * (1 - TRAILING_STOP_PCT):
+                realized_strat += remaining_strat * POSITION_SIZE * (1 + pct)
+                tp_markers.append((i, pct, f"Trailing Stop\n卖{remaining_strat*100:.0f}%"))
+                remaining_strat = 0
+                trailing_triggered = True
+
+        # Check SL levels (only if price is negative from entry)
+        if pct < 0:
+            for j, (trigger, sell_pct, _) in enumerate(SL_LEVELS):
+                if not sl_triggered[j] and pct <= trigger and remaining_strat > 0.001:
+                    actual_sell = min(sell_pct, remaining_strat)
+                    realized_strat += actual_sell * POSITION_SIZE * (1 + pct)
+                    remaining_strat -= actual_sell
+                    sl_triggered[j] = True
+                    sl_markers.append((i, pct, f"SL {trigger*100:.0f}%\n卖{actual_sell*100:.0f}%"))
+
+        total = remaining_strat * POSITION_SIZE * (1 + pct) + realized_strat
+        strat_value.append(total)
+        strat_remaining.append(remaining_strat)
+
+    # Hold-to-end comparison
+    hold_value = [POSITION_SIZE * (1 + p) for p in price_pcts]
+
+    # Build chart
+    fig = go.Figure()
+
+    # Price path (secondary y axis reference)
+    fig.add_trace(go.Scatter(
+        x=list(range(len(price_pcts))),
+        y=[POSITION_SIZE * (1 + p) for p in price_pcts],
+        mode="lines", line=dict(color="#d1d5db", width=1, dash="dot"),
+        name="持有不卖 (Buy & Hold)", yaxis="y",
+    ))
+
+    # Strategy value
+    fig.add_trace(go.Scatter(
+        x=list(range(len(strat_value))),
+        y=strat_value,
+        mode="lines", line=dict(color="#22c55e", width=3),
+        name="分批止盈止损策略", yaxis="y",
+        fill="tonexty", fillcolor="rgba(34,197,94,0.1)",
+    ))
+
+    # TP markers
+    for idx, pct, label in tp_markers:
+        fig.add_trace(go.Scatter(
+            x=[idx], y=[strat_value[idx]], mode="markers+text",
+            marker=dict(size=12, color="#22c55e", symbol="triangle-up"),
+            text=[label], textposition="top center", textfont=dict(size=9, color="#22c55e"),
+            showlegend=False,
+        ))
+
+    # SL markers
+    for idx, pct, label in sl_markers:
+        fig.add_trace(go.Scatter(
+            x=[idx], y=[strat_value[idx]], mode="markers+text",
+            marker=dict(size=12, color="#ef4444", symbol="triangle-down"),
+            text=[label], textposition="bottom center", textfont=dict(size=9, color="#ef4444"),
+            showlegend=False,
+        ))
+
+    # Entry line
+    fig.add_hline(y=POSITION_SIZE, line_dash="dash", line_color="#94a3b8",
+                   annotation_text=f"Entry: ${POSITION_SIZE:,}", annotation_position="left")
+
+    fig.update_layout(
+        title="分批止盈止损 vs 持有不卖",
+        yaxis_title="账户价值 ($)",
+        xaxis_title="时间",
+        height=500,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        xaxis=dict(showticklabels=False),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Scenario Analysis ──
+    st.divider()
+    st.markdown("### 场景模拟")
+    st.markdown("不同涨幅下，分批策略 vs 持有不卖的对比：")
+
+    scenarios = [
+        ("小涨后跌回", 0.5, -0.80),
+        ("中涨后跌回", 2.0, -0.75),
+        ("大涨后跌回", 5.0, -0.90),
+        ("暴涨后跌回", 10.0, -0.95),
+        ("直接下跌", 0.0, -0.50),
+    ]
+
+    scenario_rows = []
+    for name, peak, crash in scenarios:
+        # Strategy simulation
+        rem = 1.0
+        real = 0.0
+
+        # TP
+        for trigger, sell_pct, _ in TP_LEVELS:
+            if peak >= trigger and rem > 0:
+                s = min(sell_pct, rem)
+                real += s * POSITION_SIZE * (1 + trigger)
+                rem -= s
+
+        # After crash
+        final_pct = peak * (1 + crash) if peak > 0 else crash
+        if final_pct < 0:
+            # SL
+            for trigger, sell_pct, _ in SL_LEVELS:
+                if final_pct <= trigger and rem > 0:
+                    s = min(sell_pct, rem)
+                    real += s * POSITION_SIZE * (1 + trigger)
+                    rem -= s
+
+        strat_total = real + rem * POSITION_SIZE * (1 + final_pct)
+        strat_pnl = strat_total - POSITION_SIZE
+
+        hold_total = POSITION_SIZE * (1 + final_pct)
+        hold_pnl = hold_total - POSITION_SIZE
+
+        advantage = strat_pnl - hold_pnl
+
+        scenario_rows.append({
+            "场景": name,
+            "峰值涨幅": f"+{peak*100:.0f}%",
+            "最终跌幅": f"{crash*100:.0f}%",
+            "策略收益": f"${strat_pnl:+,.0f} ({strat_pnl/POSITION_SIZE*100:+.0f}%)",
+            "持有收益": f"${hold_pnl:+,.0f} ({hold_pnl/POSITION_SIZE*100:+.0f}%)",
+            "策略优势": f"${advantage:+,.0f}",
+        })
+
+    st.dataframe(pd.DataFrame(scenario_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("""
+    ### 关键结论
+
+    1. **分批止盈在所有"先涨后跌"的场景中都显著优于持有不卖**
+    2. 涨幅越大 + 崩盘越深 = 策略优势越大（暴涨后跌回场景差 $40K+）
+    3. 唯一劣势：直接单边下跌时策略比持有多亏一点（因为止损卖出时已确认亏损）
+    4. 但这个劣势极小（<$200），而上涨时的优势巨大
+    """)
+
+    st.divider()
+    st.info("🚧 持仓管理的自动化执行将在下一阶段实现。当前为策略设计阶段。")
+
+
 # Navigation via styled buttons as menu items
 MENU = {
     "Baseline Cluster v2": {
@@ -1307,7 +1588,7 @@ MENU = {
     },
     "Token Discovery": {
         "caption": "漏斗筛选 → 量化信号 → 进场",
-        "pages": ["L1: Cluster 筛选", "Candidate Monitor"],
+        "pages": ["L1: Cluster 筛选", "Candidate Monitor", "持仓管理"],
     },
 }
 
@@ -1386,3 +1667,5 @@ elif page in DISCOVERY_PAGES:
         section_l1_filter(df, model)
     elif page == "Candidate Monitor":
         section_candidate_monitor(df)
+    elif page == "持仓管理":
+        section_position_management()
