@@ -1194,7 +1194,7 @@ def section_l1_filter(df, model):
                 for _, r in filtered.iterrows():
                     filt_data.append({
                         "Token": r["symbol"],
-                        "Cluster": f"#{int(r['cluster_rank'])} {r['cluster_name']}" if r["cluster_rank"] else "无法分类",
+                        "Cluster": f"#{int(r['cluster_rank'])} {r['cluster_name']}" if pd.notna(r["cluster_rank"]) else "无法分类",
                         "MCap": f"${r['mcap']:,.0f}",
                         "Holders": r["holders"],
                         "原因": r["cluster_name"],
