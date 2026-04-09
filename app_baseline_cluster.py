@@ -1427,7 +1427,7 @@ def section_position_management():
     st.caption(f"**{selected_token['symbol']}** — 从市值 ${entry_price:,.0f} 入场，共 {len(price_pcts)} 小时数据")
 
     # Load momentum model for this token
-    momentum_model_path = os.path.join(OUTPUT_DIR, "momentum_model.cbm")
+    momentum_model_path = os.path.join("token_discovery", "momentum_model.cbm")
     has_momentum = os.path.isfile(momentum_model_path)
     if has_momentum:
         from catboost import CatBoostRegressor
