@@ -1392,14 +1392,50 @@ def section_position_management():
 
     st.divider()
 
-    # ── Visualization: Staircase TP/SL ──
-    st.markdown("### 可视化：仓位变化曲线")
+    # ── Visualization with real token data ──
+    st.markdown("### 可视化：实际 Token 回测")
 
-    # Simulate price path: entry → ATH → crash
-    price_pcts = np.concatenate([
-        np.linspace(0, 12, 200),    # rise to +1200%
-        np.linspace(12, -0.5, 100),  # crash to -50%
-    ])
+    # Token selector from cluster #5 + #6
+    cluster_csv = os.path.join(CLUSTER_DIR, "clusters.csv")
+    if os.path.isfile(cluster_csv):
+        cdf_all = pd.read_csv(cluster_csv)
+        organic_tokens = cdf_all[cdf_all["rank"].isin([5, 6])].sort_values("ath", ascending=False)
+        token_options = [f"{r['symbol']} (ATH ${r['ath']:,.0f}, #{r['rank']})"
+                         for _, r in organic_tokens.iterrows()]
+        selected_idx = st.selectbox("选择 Token 回测", range(len(token_options)),
+                                     format_func=lambda i: token_options[i],
+                                     index=0, key="pos_token_select")
+        selected_token = organic_tokens.iloc[selected_idx]
+    else:
+        st.warning("聚类数据未找到")
+        return
+
+    # Load actual price data
+    addr = selected_token["address"]
+    h_files = sorted([f for f in glob.glob(os.path.join(DATA_DIR, addr, "token_mcap_candles_[0-9]*.json"))
+                       if "5m" not in os.path.basename(f)])
+    if not h_files:
+        st.warning("无价格数据")
+        return
+
+    with open(h_files[-1]) as f:
+        raw = json.load(f)
+    candles = (raw or {}).get("data", {}).get("list", [])
+    if not candles:
+        st.warning("无蜡烛图数据")
+        return
+
+    mcap_arr = np.array([float(c["close"]) for c in sorted(candles, key=lambda x: int(x["time"]))])
+    start_idx = next((i for i in range(len(mcap_arr)) if mcap_arr[i] >= 100000), None)
+    if start_idx is None:
+        st.warning("Token 市值未达到 $100K")
+        return
+
+    mcap_arr = mcap_arr[start_idx:]
+    entry_price = mcap_arr[0]
+    price_pcts = (mcap_arr - entry_price) / entry_price
+
+    st.caption(f"**{selected_token['symbol']}** — 从市值 ${entry_price:,.0f} 入场，共 {len(price_pcts)} 小时数据")
 
     # Strategy simulation
     remaining_strat = 1.0
@@ -1503,14 +1539,26 @@ def section_position_management():
                    annotation_text=f"Entry: ${POSITION_SIZE:,}", annotation_position="left")
 
     fig.update_layout(
-        title="分批止盈止损 vs 持有不卖",
+        title=f"{selected_token['symbol']} — 分批止盈止损 vs 持有不卖",
         yaxis_title="账户价值 ($)",
-        xaxis_title="时间",
+        xaxis_title="时间 (小时)",
         height=500,
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        xaxis=dict(showticklabels=False),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    # Final PnL summary
+    final_strat = strat_value[-1] if strat_value else POSITION_SIZE
+    final_hold = POSITION_SIZE * (1 + price_pcts[-1])
+    peak_hold = POSITION_SIZE * (1 + price_pcts.max())
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+    col_s1.metric("分批策略最终", f"${final_strat:,.0f}",
+                   f"{(final_strat/POSITION_SIZE - 1)*100:+.0f}%")
+    col_s2.metric("持有不卖最终", f"${final_hold:,.0f}",
+                   f"{(final_hold/POSITION_SIZE - 1)*100:+.0f}%")
+    col_s3.metric("策略优势", f"${final_strat - final_hold:+,.0f}",
+                   f"峰值时持有价值 ${peak_hold:,.0f}")
 
     # ── Scenario Analysis ──
     st.divider()
