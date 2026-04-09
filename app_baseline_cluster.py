@@ -1405,6 +1405,274 @@ def section_position_management():
     > 成熟阶段（>$2M）用复合卖压+利润锁定保护收益。
     """)
 
+    # ── Token Backtest Visualization ──
+    st.divider()
+    st.markdown("### 回测可视化")
+
+    from token_discovery.lifecycle_strategy import (
+        load_token_data, run_lifecycle_strategy, run_fixed_strategy,
+        compute_life_signals, get_mcap_phase, compute_sell_pressure,
+        load_organic_tokens, SLIPPAGE as LC_SLIPPAGE,
+    )
+
+    cluster_csv = os.path.join(CLUSTER_DIR, "clusters.csv")
+    if not os.path.isfile(cluster_csv):
+        st.warning("聚类数据未找到")
+        return
+
+    cdf_all = pd.read_csv(cluster_csv)
+    organic_tokens = cdf_all[cdf_all["rank"].isin([5, 6])].sort_values("ath", ascending=False)
+    token_options = [f"{r['symbol']} (ATH ${r['ath']:,.0f})" for _, r in organic_tokens.iterrows()]
+
+    col_sel, col_mcap, col_pos = st.columns([3, 1, 1])
+    with col_sel:
+        selected_idx = st.selectbox("选择 Token", range(len(token_options)),
+                                     format_func=lambda i: token_options[i], index=0,
+                                     key="pos_token_select")
+    with col_mcap:
+        entry_mcap = st.number_input("入场市值 ($)", min_value=50000, max_value=100000000,
+                                      value=300000, step=50000, key="entry_mcap_input")
+    with col_pos:
+        position_size = st.number_input("仓位金额 ($)", min_value=100, max_value=1000000,
+                                         value=5000, step=1000, key="pos_size_input")
+
+    if st.button("Run Backtest", key="run_backtest_btn", type="primary"):
+        selected_token = organic_tokens.iloc[selected_idx]
+        addr = selected_token["address"]
+        data = load_token_data(addr)
+
+        if data is None:
+            st.error("无法加载数据")
+        else:
+            mcap_full = data["mcap"]
+            volume_full = data["volume"]
+            holders_full = data["holders"]
+
+            entry_idx = next((i for i in range(len(mcap_full)) if mcap_full[i] >= entry_mcap), None)
+            if entry_idx is None:
+                st.warning(f"Token 市值从未达到 ${entry_mcap:,.0f}")
+            else:
+                mcap = mcap_full[entry_idx:]
+                volume = volume_full[entry_idx:]
+                holders = holders_full[entry_idx:]
+                n = len(mcap)
+                entry_price = mcap[0]
+
+                st.caption(f"**{selected_token['symbol']}** — 入场 ${entry_price:,.0f}，"
+                           f"{n}h 数据，ATH ${mcap.max():,.0f} "
+                           f"(+{(mcap.max()/entry_price - 1)*100:.0f}%)")
+
+                # ── Replay v3 strategy tick-by-tick ──
+                remaining = 1.0
+                realized = 0.0
+                peak_price = entry_price
+                peak_pnl = 0.0
+                lc_value = []
+                lc_markers = []
+                phase_colors = []  # track phase per tick
+
+                for t in range(n):
+                    current = mcap[t]
+                    pnl = (current - entry_price) / max(entry_price, 1)
+                    peak_price = max(peak_price, current)
+                    peak_pnl = max(peak_pnl, pnl)
+                    dd = (current - peak_price) / max(peak_price, 1)
+                    phase = get_mcap_phase(current)
+                    phase_colors.append(phase)
+
+                    if remaining > 0.001:
+                        signals = compute_life_signals(mcap, volume, holders, t)
+                        action = None
+                        if signals is not None:
+                            sp = compute_sell_pressure(signals, pnl, dd, phase)
+                            # Replay exact v3 rules
+                            if phase == "early":
+                                if dd < -0.80 and signals["declining_hours"] >= 12:
+                                    sell = remaining
+                                    realized += sell * current * (1 - LC_SLIPPAGE) / entry_price * position_size - sell * position_size
+                                    remaining = 0; action = "EXIT(rug)"
+                                elif (signals["declining_hours"] >= 20 and signals["volume_trend"] < 0.3
+                                        and signals["roc_12h"] < -0.15):
+                                    sell = remaining
+                                    realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining = 0; action = "EXIT(dead)"
+                            elif phase == "growth":
+                                if dd < -0.70 and signals["declining_hours"] >= 6:
+                                    sell = remaining
+                                    realized += sell * current * (1 - LC_SLIPPAGE) / entry_price * position_size - sell * position_size
+                                    remaining = 0; action = "EXIT(rug)"
+                                elif signals["declining_hours"] >= 30:
+                                    sell = remaining; realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining = 0; action = "EXIT(30h)"
+                                elif signals["declining_hours"] >= 15 and signals["volume_trend"] < 0.5:
+                                    sell = min(0.35, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP35%"
+                                elif signals["declining_hours"] >= 8:
+                                    sell = min(0.20, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP20%"
+                                elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.80:
+                                    sell = min(0.15, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP15%"
+                                elif (abs(signals["holder_trend"]) < 0.001 and pnl > 0.40
+                                        and signals["roc_4h"] < -0.03 and signals["price_vs_vwap"] < -0.05):
+                                    sell = min(0.15, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP15%(fade)"
+                            else:  # maturity
+                                if dd < -0.70 and not signals["holder_growing"]:
+                                    sell = remaining
+                                    realized += sell * current * (1 - LC_SLIPPAGE) / entry_price * position_size - sell * position_size
+                                    remaining = 0; action = "EXIT(rug)"
+                                elif signals["declining_hours"] >= 24:
+                                    sell = remaining; realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining = 0; action = "EXIT(24h)"
+                                elif signals["declining_hours"] >= 12 and signals["volume_trend"] < 0.5:
+                                    sell = min(0.40, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP40%"
+                                elif signals["declining_hours"] >= 6:
+                                    sell = min(0.25, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP25%"
+                                elif peak_pnl >= 5.0 and dd < -0.35 and sp >= 0.35:
+                                    sell = min(0.40, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP40%(lock)"
+                                elif peak_pnl >= 2.0 and dd < -0.45 and sp >= 0.35:
+                                    sell = min(0.30, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP30%(lock)"
+                                elif (pnl > 0.80 and signals["holder_accel"] < -0.003
+                                        and signals["roc_4h"] < -0.02 and signals["price_vs_vwap"] < -0.03):
+                                    sell = min(0.20, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP20%(fade)"
+                                elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.50:
+                                    sell = min(0.20, remaining); realized += sell * pnl * position_size * (1 - LC_SLIPPAGE)
+                                    remaining -= sell; action = "TP20%"
+
+                        total = realized + remaining * position_size * (1 + pnl)
+                        lc_value.append(total)
+                        if action:
+                            lc_markers.append((t, total, action))
+                    else:
+                        lc_value.append(realized)
+
+                # ── Fixed strategy value curve ──
+                FIXED_TP = [(0.30, 0.15), (0.80, 0.20), (2.00, 0.20), (5.00, 0.20), (10.00, 0.15)]
+                FIXED_SL = [(-0.15, 0.30), (-0.30, 0.30), (-0.50, 1.00)]
+                rem_f = 1.0; real_f = 0.0
+                tp_f = [False] * len(FIXED_TP); sl_f = [False] * len(FIXED_SL)
+                fixed_value = []
+                for t in range(n):
+                    pnl = (mcap[t] - entry_price) / max(entry_price, 1)
+                    if rem_f > 0.001:
+                        for j, (tr, sp) in enumerate(FIXED_TP):
+                            if not tp_f[j] and pnl >= tr:
+                                s = min(sp, rem_f); real_f += s * pnl * position_size * 0.97; rem_f -= s; tp_f[j] = True
+                        if pnl < 0:
+                            for j, (tr, sp) in enumerate(FIXED_SL):
+                                if not sl_f[j] and pnl <= tr:
+                                    s = min(sp, rem_f); real_f += s * pnl * position_size * 0.97; rem_f -= s; sl_f[j] = True
+                    fixed_value.append(real_f + rem_f * position_size * (1 + pnl))
+
+                # ── Buy & Hold curve ──
+                hold_value = [position_size * (1 + (mcap[t] - entry_price) / max(entry_price, 1)) for t in range(n)]
+
+                # ── Build chart ──
+                from plotly.subplots import make_subplots
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # MCap curve (secondary y, light background)
+                fig.add_trace(go.Scatter(
+                    x=list(range(n)), y=mcap.tolist(),
+                    mode="lines", line=dict(color="#e5e7eb", width=1),
+                    name="MCap", hovertemplate="T%{x}: $%{y:,.0f}",
+                ), secondary_y=True)
+
+                # Phase background bands
+                phase_map = {"early": "#dbeafe", "growth": "#fef9c3", "maturity": "#dcfce7"}
+                prev_phase = phase_colors[0]
+                start_t = 0
+                for t in range(1, n):
+                    if phase_colors[t] != prev_phase or t == n - 1:
+                        end_t = t if t < n - 1 else n
+                        fig.add_vrect(x0=start_t, x1=end_t, fillcolor=phase_map.get(prev_phase, "#f3f4f6"),
+                                       opacity=0.15, line_width=0)
+                        start_t = t
+                        prev_phase = phase_colors[t]
+
+                # Strategy curves
+                fig.add_trace(go.Scatter(
+                    x=list(range(n)), y=hold_value,
+                    mode="lines", line=dict(color="#d1d5db", width=1, dash="dot"),
+                    name="Buy & Hold",
+                ), secondary_y=False)
+
+                fig.add_trace(go.Scatter(
+                    x=list(range(n)), y=fixed_value,
+                    mode="lines", line=dict(color="#22c55e", width=2, dash="dash"),
+                    name="Fixed TP/SL",
+                ), secondary_y=False)
+
+                fig.add_trace(go.Scatter(
+                    x=list(range(n)), y=lc_value,
+                    mode="lines", line=dict(color="#3b82f6", width=3),
+                    name="Lifecycle v3",
+                ), secondary_y=False)
+
+                # Sell markers
+                for t, val, label in lc_markers:
+                    is_tp = "TP" in label
+                    color = "#22c55e" if is_tp else "#ef4444"
+                    symbol = "triangle-down" if is_tp else "x"
+                    fig.add_trace(go.Scatter(
+                        x=[t], y=[val], mode="markers+text",
+                        marker=dict(size=12, color=color, symbol=symbol, line=dict(width=1, color="white")),
+                        text=[label], textposition="top center", textfont=dict(size=8, color=color),
+                        showlegend=False, hovertemplate=f"T%{{x}}: ${val:,.0f}<br>{label}",
+                    ), secondary_y=False)
+
+                # Holder overlay
+                if holders.max() > 0:
+                    fig.add_trace(go.Scatter(
+                        x=list(range(n)), y=holders.tolist(),
+                        mode="lines", line=dict(color="#f59e0b", width=1, dash="dot"),
+                        name="Holders", opacity=0.5,
+                    ), secondary_y=True)
+
+                # Entry line
+                fig.add_hline(y=position_size, line_dash="dash", line_color="#94a3b8",
+                               annotation_text=f"Entry: ${position_size:,}", annotation_position="left",
+                               secondary_y=False)
+
+                fig.update_layout(
+                    title=f"{selected_token['symbol']} — Lifecycle v3 Backtest",
+                    height=600,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    hovermode="x unified",
+                )
+                fig.update_yaxes(title_text="账户价值 ($)", secondary_y=False)
+                fig.update_yaxes(title_text="MCap / Holders", secondary_y=True, showgrid=False)
+                fig.update_xaxes(title_text="时间 (小时)")
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # ── Summary metrics ──
+                final_lc = lc_value[-1] if lc_value else position_size
+                final_fixed = fixed_value[-1] if fixed_value else position_size
+                final_hold = hold_value[-1]
+
+                col_s1, col_s2, col_s3 = st.columns(3)
+                col_s1.metric("Lifecycle v3", f"${final_lc:,.0f}",
+                               f"{(final_lc/position_size - 1)*100:+.1f}%")
+                col_s2.metric("Fixed TP/SL", f"${final_fixed:,.0f}",
+                               f"{(final_fixed/position_size - 1)*100:+.1f}%")
+                col_s3.metric("Buy & Hold", f"${final_hold:,.0f}",
+                               f"{(final_hold/position_size - 1)*100:+.1f}%")
+
+                # Actions log
+                if lc_markers:
+                    with st.expander(f"操作记录 ({len(lc_markers)} 笔)"):
+                        for t, val, label in lc_markers:
+                            phase = get_mcap_phase(mcap[t])
+                            pnl_at_t = (mcap[t] - entry_price) / max(entry_price, 1)
+                            st.text(f"T={t:>4d}h  MCap=${mcap[t]:>10,.0f}  Phase={phase:<8s}  "
+                                    f"PnL={pnl_at_t*100:>+7.1f}%  → {label}")
 
 
 
