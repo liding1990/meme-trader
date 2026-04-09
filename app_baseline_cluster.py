@@ -1300,31 +1300,59 @@ def section_candidate_monitor(df):
 
 
 def section_position_management():
-    """持仓管理 — Lifecycle Strategy: Holder-based position management."""
-    st.markdown("## 持仓管理")
+    """持仓管理 — Lifecycle Strategy v3: Phase-based holder position management."""
+    st.markdown("## 持仓管理 v3")
     st.markdown("""
-    **核心原则：用 Holder 健康度做止损决策，而非价格。**
+    **核心原则：用 Holder 健康度做止损决策，而非价格。MCap 阶段控制管理力度。**
 
     社区还在 = Token 还活着 = 继续持有。社区散了 = 周期结束 = 卖出。
+    早期不卖（让 runner 有时间成长），成熟期积极管理（保护利润）。
     """)
 
-    # ── Strategy Rules ──
-    st.markdown("### 策略规则")
+    # ── Phase Rules ──
+    st.markdown("### 阶段策略")
 
-    rules_data = pd.DataFrame({
-        "信号": ["Holder 持续增长", "Holder 停滞 + 浮盈 >50%", "Holder 连续下降 6h",
-                 "Holder 下降 12h + 成交量萎缩", "Holder 下降 24h+", "峰值回撤 >70% + Holder 下降"],
-        "动作": ["HOLD（无论价格怎么波动）", "止盈 20%", "止盈 25%", "止盈 40%", "全部卖出", "全部卖出（rug 保护）"],
-        "逻辑": [
-            "59% 的 runner 上升途中回调 >40%，价格止损会误杀大部分 runner",
-            "社区不再扩张，先锁定部分利润",
-            "社区开始流失，趋势可能反转",
-            "社区流失 + 成交量萎缩 = 双重确认，大幅减仓",
-            "持续 24h 的流失 = 社区已散，周期结束",
-            "深度崩盘 + 社区离开 = rug pull 或彻底死亡",
+    phase_data = pd.DataFrame({
+        "阶段": ["Early (<$500K)", "Growth ($500K-$2M)", "Growth", "Growth",
+                  "Growth", "Maturity (>$2M)", "Maturity", "Maturity",
+                  "Maturity", "Maturity"],
+        "信号": [
+            "回撤 >80% + Holder 下降 12h",
+            "回撤 >70% + Holder 下降 6h",
+            "Holder 连续下降 30h+",
+            "Holder 下降 15h + 成交量萎缩",
+            "Holder 下降 8h",
+            "回撤 >70% + Holder 未增长",
+            "历史峰值盈利 5x+ 回撤 >35% + 卖压高",
+            "Holder 下降 24h+",
+            "Holder 下降 12h + 成交量萎缩",
+            "Holder 下降 6h",
+        ],
+        "动作": [
+            "全部卖出（rug 保护）",
+            "全部卖出（rug 保护）",
+            "全部卖出",
+            "止盈 35%",
+            "止盈 20%",
+            "全部卖出（rug 保护）",
+            "止盈 40%（利润锁定）",
+            "全部卖出",
+            "止盈 40%",
+            "止盈 25%",
         ],
     })
-    st.dataframe(rules_data, hide_index=True, use_container_width=True)
+    st.dataframe(phase_data, hide_index=True, use_container_width=True)
+
+    st.markdown("### 信号维度")
+    st.markdown("""
+    | 类别 | 信号 |
+    |------|------|
+    | **Holder** | trend(12h), trend(4h), acceleration, velocity, declining hours |
+    | **Volume** | trend(6h/24h), surge, dry hours |
+    | **Price** | ROC(1h/4h/12h), VWAP deviation, drawdown, position |
+    | **效率** | MCap/Holder, MCap/Holder trend |
+    | **综合** | Composite sell pressure (0-1) |
+    """)
 
     # ── Backtest Results ──
     st.divider()
@@ -1332,14 +1360,14 @@ def section_position_management():
 
     col1, col2, col3 = st.columns(3)
     col1.markdown("""
-    **Lifecycle Strategy**
-    - 平均收益: **+550%**
-    - 中位收益: **+54%**
-    - 胜率: **61%**
-    - 平均盈利: **+927%**
-    - 平均亏损: **-46%**
-    - Profit Factor: **32.15**
-    - Sharpe: **1.75**
+    **Lifecycle v3**
+    - 平均收益: **+721%**
+    - 中位收益: **+72%**
+    - 胜率: **65%**
+    - 平均盈利: **+1149%**
+    - 平均亏损: **-58%**
+    - Profit Factor: **36.33**
+    - Sharpe: **2.07**
     """)
     col2.markdown("""
     **Fixed TP/SL**
@@ -1363,9 +1391,9 @@ def section_position_management():
     """)
 
     st.markdown("""
-    > **核心改进：** 中位收益从 Buy & Hold 的 **-46%** 提升到 **+54%**。
-    > 策略不在上升途中的回调止损（59% 的 runner 回调 >40%），
-    > 而是等到 holder 真正开始流失才卖出。
+    > **v3 改进：** PF 从 v1 的 32.15 → **36.33**，平均收益从 +550% → **+721%**。
+    > 早期阶段（<$500K）几乎不卖，让 runner 有空间成长；
+    > 成熟阶段（>$2M）用复合卖压+利润锁定保护收益。
     """)
 
     st.divider()
@@ -1392,7 +1420,10 @@ def section_position_management():
     addr = selected_token["address"]
 
     # Load data
-    from token_discovery.lifecycle_strategy import load_token_data, run_lifecycle_strategy, run_fixed_strategy, compute_life_signals
+    from token_discovery.lifecycle_strategy import (
+        load_token_data, run_lifecycle_strategy, run_fixed_strategy,
+        compute_life_signals, get_mcap_phase, compute_sell_pressure,
+    )
 
     # Entry MCap input
     entry_mcap = st.number_input("入场市值 ($)", min_value=50000, max_value=100000000,
@@ -1423,63 +1454,100 @@ def section_position_management():
     st.caption(f"**{selected_token['symbol']}** — 入场市值 ${entry_price:,.0f}，{n} 小时数据，"
                f"ATH ${mcap.max():,.0f} (+{(mcap.max()/entry_price - 1)*100:.0f}%)")
 
-    # Run lifecycle strategy and collect per-tick data
+    # Run v3 lifecycle strategy and collect per-tick data for visualization
+    _, actions_list = run_lifecycle_strategy(mcap, volume, holders)
+    # Build action lookup: t → (action_name, remaining_after)
+    action_at = {t: (act, rem) for t, act, rem, _ in actions_list}
+
+    # Replay to build value curve
     remaining = 1.0
     realized = 0.0
     peak_price = entry_price
+    peak_pnl = 0.0
     lc_value = []
     lc_markers = []
 
     for t in range(n):
-        if remaining <= 0.001:
-            lc_value.append(realized)
-            continue
-
         current = mcap[t]
         pnl = (current - entry_price) / max(entry_price, 1)
         peak_price = max(peak_price, current)
-        dd_from_peak = (current - peak_price) / max(peak_price, 1)
+        peak_pnl = max(peak_pnl, pnl)
+        drawdown_from_peak = (current - peak_price) / max(peak_price, 1)
 
         signals = compute_life_signals(mcap, volume, holders, t)
+        phase = get_mcap_phase(current)
 
-        action = None
-        if signals:
-            if dd_from_peak < -0.70 and not signals["holder_growing"]:
-                sell = remaining
-                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-                remaining = 0
-                action = "EXIT(rug)"
-            elif signals["declining_hours"] >= 24 and remaining > 0:
-                sell = remaining
-                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-                remaining = 0
-                action = "EXIT(24h)"
-            elif signals["declining_hours"] >= 12 and signals["volume_trend"] < 0.5:
-                sell = min(0.40, remaining)
-                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-                remaining -= sell
-                action = "TP40%"
-            elif signals["declining_hours"] >= 6:
-                sell = min(0.25, remaining)
-                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-                remaining -= sell
-                action = "TP25%"
-            elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.50:
-                sell = min(0.20, remaining)
-                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-                remaining -= sell
-                action = "TP20%(stagnant)"
+        if remaining > 0.001 and signals is not None:
+            sp = compute_sell_pressure(signals, pnl, drawdown_from_peak, phase)
+            action = None
 
-        total = realized + remaining * POSITION_SIZE * (1 + pnl)
+            if phase == "early":
+                if drawdown_from_peak < -0.80 and signals["declining_hours"] >= 12:
+                    sell = remaining
+                    realized += sell * current * (1 - SLIPPAGE) / entry_price * POSITION_SIZE - sell * POSITION_SIZE
+                    remaining = 0; action = "EXIT(rug)"
+                elif (signals["declining_hours"] >= 20 and signals["volume_trend"] < 0.3
+                        and signals["roc_12h"] < -0.15):
+                    sell = remaining
+                    realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining = 0; action = "EXIT(dead)"
+
+            elif phase == "growth":
+                if drawdown_from_peak < -0.70 and signals["declining_hours"] >= 6:
+                    sell = remaining
+                    realized += sell * current * (1 - SLIPPAGE) / entry_price * POSITION_SIZE - sell * POSITION_SIZE
+                    remaining = 0; action = "EXIT(rug)"
+                elif signals["declining_hours"] >= 30:
+                    sell = remaining; realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining = 0; action = "EXIT(30h)"
+                elif signals["declining_hours"] >= 15 and signals["volume_trend"] < 0.5:
+                    sell = min(0.35, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP35%"
+                elif signals["declining_hours"] >= 8:
+                    sell = min(0.20, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP20%"
+                elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.80:
+                    sell = min(0.15, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP15%(stagnant)"
+                elif (abs(signals["holder_trend"]) < 0.001 and pnl > 0.40
+                        and signals["roc_4h"] < -0.03 and signals["price_vs_vwap"] < -0.05):
+                    sell = min(0.15, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP15%(fade)"
+
+            else:  # maturity
+                if drawdown_from_peak < -0.70 and not signals["holder_growing"]:
+                    sell = remaining
+                    realized += sell * current * (1 - SLIPPAGE) / entry_price * POSITION_SIZE - sell * POSITION_SIZE
+                    remaining = 0; action = "EXIT(rug)"
+                elif signals["declining_hours"] >= 24:
+                    sell = remaining; realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining = 0; action = "EXIT(24h)"
+                elif signals["declining_hours"] >= 12 and signals["volume_trend"] < 0.5:
+                    sell = min(0.40, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP40%"
+                elif signals["declining_hours"] >= 6:
+                    sell = min(0.25, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP25%"
+                elif peak_pnl >= 5.0 and drawdown_from_peak < -0.35 and sp >= 0.35:
+                    sell = min(0.40, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP40%(lock)"
+                elif peak_pnl >= 2.0 and drawdown_from_peak < -0.45 and sp >= 0.35:
+                    sell = min(0.30, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP30%(lock)"
+                elif (pnl > 0.80 and signals["holder_accel"] < -0.003
+                        and signals["roc_4h"] < -0.02 and signals["price_vs_vwap"] < -0.03):
+                    sell = min(0.20, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP20%(fade)"
+                elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.50:
+                    sell = min(0.20, remaining); realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                    remaining -= sell; action = "TP20%(stagnant)"
+
+            if action:
+                total = realized + remaining * POSITION_SIZE * (1 + pnl)
+                lc_markers.append((t, total, action))
+
+        total = realized + remaining * POSITION_SIZE * (1 + pnl) if remaining > 0.001 else realized
         lc_value.append(total)
-
-        if action:
-            lc_markers.append((t, total, action))
-
-    if remaining > 0.001:
-        final_pnl = (mcap[-1] - entry_price) / max(entry_price, 1)
-        realized += remaining * final_pnl * POSITION_SIZE * (1 - SLIPPAGE)
-        lc_value[-1] = realized + remaining * POSITION_SIZE * (1 + final_pnl)
 
     # Fixed strategy
     fixed_ret = run_fixed_strategy(mcap)
@@ -1512,7 +1580,7 @@ def section_position_management():
 
     fig.add_trace(go.Scatter(x=list(range(n)), y=lc_value,
                               mode="lines", line=dict(color="#3b82f6", width=3),
-                              name="Lifecycle Strategy"))
+                              name="Lifecycle v3"))
 
     fig.add_trace(go.Scatter(x=list(range(n)), y=fixed_value,
                               mode="lines", line=dict(color="#22c55e", width=2, dash="dash"),
@@ -1537,7 +1605,7 @@ def section_position_management():
                    annotation_text=f"Entry: ${POSITION_SIZE:,}", annotation_position="left")
 
     fig.update_layout(
-        title=f"{selected_token['symbol']} — Lifecycle Strategy vs Fixed vs Hold",
+        title=f"{selected_token['symbol']} — Lifecycle v3 vs Fixed vs Hold",
         yaxis_title="账户价值 ($)", xaxis_title="时间 (小时)",
         yaxis2=dict(title="Holders", overlaying="y", side="right", showgrid=False),
         height=550, legend=dict(orientation="h", yanchor="bottom", y=1.02),
@@ -1550,7 +1618,7 @@ def section_position_management():
     final_hold = hold_value[-1]
 
     col_s1, col_s2, col_s3 = st.columns(3)
-    col_s1.metric("Lifecycle Strategy", f"${final_lc:,.0f}",
+    col_s1.metric("Lifecycle v3", f"${final_lc:,.0f}",
                    f"{(final_lc/POSITION_SIZE - 1)*100:+.0f}%")
     col_s2.metric("Fixed TP/SL", f"${final_fixed:,.0f}",
                    f"{(final_fixed/POSITION_SIZE - 1)*100:+.0f}%")
@@ -1559,7 +1627,7 @@ def section_position_management():
 
     # Holder chart detail
     if holders.max() > 0:
-        st.caption("黄色虚线 = Holder 数量（右轴）。Lifecycle Strategy 在 holder 开始下降时才卖出。")
+        st.caption("黄色虚线 = Holder 数量（右轴）。v3 在早期（<$500K）几乎不卖，成熟期（>$2M）积极管理。")
 
 
 

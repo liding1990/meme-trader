@@ -1,10 +1,19 @@
-"""Lifecycle Strategy — Holder-based position management.
+"""Lifecycle Strategy v3 — Phase-based holder position management.
 
 Core principle: don't use price for stop loss. Use "life signals":
   - Holder still growing → HOLD (no matter how much price drops)
   - Holder stagnating → start taking profit
   - Holder declining → accelerate selling
   - Holder collapsing + volume dying → EXIT
+
+3 MCap phases control how aggressively we manage:
+  Early (<$500K): Pure hold, only catastrophic rug protection
+  Growth ($500K-$2M): Relaxed thresholds (8h/15h/30h)
+  Maturity (>$2M): Standard rules + trailing profit lock + momentum fading
+
+Rich signals: holder trend/accel/velocity, volume trend/surge/dry,
+  price ROC multi-timeframe, VWAP deviation, mcap/holder efficiency,
+  composite sell pressure score.
 
 Backtest covers FULL lifecycle (entry → end of data), not just to ATH.
 
@@ -103,19 +112,14 @@ def load_token_data(address):
 
 
 def compute_life_signals(mcap, volume, holders, t, window=12):
-    """Compute life signals at time t.
+    """Compute rich life signals at time t.
 
-    Returns dict with:
-      holder_trend: avg hourly holder change over window (positive = growing)
-      holder_accel: change in holder_trend (accelerating/decelerating)
-      volume_trend: recent vs historical volume ratio
-      holder_growing: bool, is holder count increasing?
-      holder_declining: number of consecutive hours of holder decline
+    Returns dict with holder, volume, price, and composite signals.
     """
     if t < window:
         return None
 
-    # Holder trend: average hourly change over window
+    # ── Holder signals ──
     h_window = holders[t-window:t+1]
     if h_window[0] > 0:
         holder_changes = np.diff(h_window) / np.maximum(h_window[:-1], 1)
@@ -123,7 +127,7 @@ def compute_life_signals(mcap, volume, holders, t, window=12):
     else:
         holder_trend = 0
 
-    # Holder acceleration
+    # Holder acceleration (is growth speeding up or slowing down?)
     if t >= window * 2:
         h_prev = holders[t-window*2:t-window+1]
         if h_prev[0] > 0:
@@ -135,47 +139,191 @@ def compute_life_signals(mcap, volume, holders, t, window=12):
     else:
         holder_accel = 0
 
-    # Volume trend
-    vol_recent = volume[max(0,t-6):t+1].mean()
-    vol_hist = volume[max(0,t-24):t+1].mean()
-    volume_trend = vol_recent / max(vol_hist, 1)
+    # Short-term holder trend (4h) — more responsive
+    if t >= 4 and holders[t-4] > 0:
+        holder_trend_4h = (holders[t] - holders[t-4]) / max(holders[t-4], 1)
+    else:
+        holder_trend_4h = 0
 
-    # Consecutive declining hours
+    # Consecutive declining hours (scan up to 48h back)
     declining_hours = 0
-    for i in range(t, max(t-24, 0), -1):
+    for i in range(t, max(t-48, 0), -1):
         if i > 0 and holders[i] < holders[i-1]:
             declining_hours += 1
         else:
             break
 
+    # Holder velocity: absolute new holders per hour (not just %)
+    if t >= 4:
+        holder_velocity = (holders[t] - holders[t-4]) / 4
+    else:
+        holder_velocity = 0
+
+    # ── Volume signals ──
+    vol_recent = volume[max(0,t-6):t+1].mean()
+    vol_hist = volume[max(0,t-24):t+1].mean()
+    volume_trend = vol_recent / max(vol_hist, 1)
+
+    # Volume surge: is current hour volume spiking?
+    vol_4h_avg = volume[max(0,t-4):t+1].mean()
+    vol_24h_avg = volume[max(0,t-24):t+1].mean() if t >= 24 else vol_4h_avg
+    volume_surge = volume[t] / max(vol_24h_avg, 1)
+
+    # Volume drying: consecutive hours of below-average volume
+    vol_dry_hours = 0
+    if t >= 24:
+        vol_ma = volume[max(0,t-24):t+1].mean()
+        for i in range(t, max(t-24, 0), -1):
+            if volume[i] < vol_ma * 0.5:
+                vol_dry_hours += 1
+            else:
+                break
+
+    # ── Price momentum signals ──
+    # ROC at multiple timeframes
+    roc_1h = (mcap[t] - mcap[t-1]) / max(mcap[t-1], 1) if t >= 1 else 0
+    roc_4h = (mcap[t] - mcap[t-4]) / max(mcap[t-4], 1) if t >= 4 else 0
+    roc_12h = (mcap[t] - mcap[t-12]) / max(mcap[t-12], 1) if t >= 12 else 0
+
+    # VWAP deviation — price above/below volume-weighted average
+    vwap_len = min(24, t+1)
+    cum_vol = volume[t-vwap_len+1:t+1].sum()
+    cum_vp = (mcap[t-vwap_len+1:t+1] * volume[t-vwap_len+1:t+1]).sum()
+    vwap = cum_vp / max(cum_vol, 1)
+    price_vs_vwap = mcap[t] / max(vwap, 1) - 1  # >0 means above VWAP
+
+    # Drawdown from running peak
+    peak = np.max(mcap[:t+1])
+    drawdown = (mcap[t] - peak) / max(peak, 1)
+
+    # Price position in 24h range (0=at low, 1=at high)
+    recent = mcap[max(0,t-24):t+1]
+    price_range = recent.max() - recent.min()
+    price_position = (mcap[t] - recent.min()) / max(price_range, 1)
+
+    # ── MCap/Holder efficiency ──
+    mcap_per_holder = mcap[t] / max(holders[t], 1)
+    if t >= 12 and holders[t-12] > 0:
+        prev_mph = mcap[t-12] / max(holders[t-12], 1)
+        mph_trend = (mcap_per_holder - prev_mph) / max(prev_mph, 1)
+    else:
+        mph_trend = 0
+
     return {
+        # Holder
         "holder_trend": holder_trend,
+        "holder_trend_4h": holder_trend_4h,
         "holder_accel": holder_accel,
-        "volume_trend": volume_trend,
         "holder_growing": holder_trend > 0.001,
         "declining_hours": declining_hours,
+        "holder_velocity": holder_velocity,
+        # Volume
+        "volume_trend": volume_trend,
+        "volume_surge": volume_surge,
+        "vol_dry_hours": vol_dry_hours,
+        # Price
+        "roc_1h": roc_1h,
+        "roc_4h": roc_4h,
+        "roc_12h": roc_12h,
+        "price_vs_vwap": price_vs_vwap,
+        "drawdown": drawdown,
+        "price_position": price_position,
+        # Efficiency
+        "mcap_per_holder": mcap_per_holder,
+        "mph_trend": mph_trend,
     }
 
 
 # ── Strategy ─────────────────────────────────────────────────────────────────
 
 
-def run_lifecycle_strategy(mcap, volume, holders):
-    """Run lifecycle strategy on a single token.
+def get_mcap_phase(mcap_value):
+    """Determine market phase based on current mcap.
 
-    Rules:
-    1. Holder growing → HOLD (even if price drops 50%)
-    2. Holder stagnating (trend ≈ 0) + profit > 50% → TP 20%
-    3. Holder declining for 6+ consecutive hours → TP 25%
-    4. Holder declining for 12+ hours + volume shrinking → TP 40%
-    5. Holder declining for 24+ hours → EXIT remaining
-    6. Hard stop: -70% from peak AND holder declining → EXIT (rug protection)
+    3 phases:
+      Early (<$500K): Pure hold, only catastrophic rug protection
+      Growth ($500K-$2M): Relaxed thresholds (1.5x standard)
+      Maturity (>$2M): Full management with trailing locks + momentum
+    """
+    if mcap_value < 500_000:
+        return "early"
+    elif mcap_value < 2_000_000:
+        return "growth"
+    else:
+        return "maturity"
+
+
+def compute_sell_pressure(signals, pnl, drawdown_from_peak, phase):
+    """Compute a composite sell pressure score [0, 1].
+
+    Combines multiple weak signals into one strong signal.
+    Higher = more urgency to sell.
+    """
+    pressure = 0.0
+
+    # Holder decline — strongest signal
+    dh = signals["declining_hours"]
+    if dh >= 24:
+        pressure += 0.5
+    elif dh >= 12:
+        pressure += 0.3
+    elif dh >= 6:
+        pressure += 0.15
+
+    # Holder acceleration turning negative (growth decelerating)
+    if signals["holder_accel"] < -0.005:
+        pressure += 0.1
+    elif signals["holder_accel"] < -0.002:
+        pressure += 0.05
+
+    # Volume drying up
+    if signals["vol_dry_hours"] >= 12:
+        pressure += 0.15
+    elif signals["vol_dry_hours"] >= 6:
+        pressure += 0.08
+    elif signals["volume_trend"] < 0.3:
+        pressure += 0.1
+
+    # Price below VWAP — sellers in control
+    if signals["price_vs_vwap"] < -0.15:
+        pressure += 0.1
+    elif signals["price_vs_vwap"] < -0.05:
+        pressure += 0.05
+
+    # Price momentum all negative — multi-timeframe confirmation
+    neg_count = sum(1 for r in [signals["roc_1h"], signals["roc_4h"], signals["roc_12h"]] if r < -0.02)
+    if neg_count == 3:
+        pressure += 0.15
+    elif neg_count >= 2:
+        pressure += 0.08
+
+    # MCap/holder efficiency declining (price falling faster than holders leaving = dump)
+    if signals["mph_trend"] < -0.2:
+        pressure += 0.1
+
+    # Drawdown from peak — deeper drawdown adds urgency
+    if drawdown_from_peak < -0.50:
+        pressure += 0.1
+    elif drawdown_from_peak < -0.30:
+        pressure += 0.05
+
+    return min(pressure, 1.0)
+
+
+def run_lifecycle_strategy(mcap, volume, holders):
+    """Run lifecycle strategy v3 — 3-phase mcap gates + rich signals.
+
+    Phase gates control WHEN management activates:
+      Early (<$500K): Pure hold, only catastrophic rug protection
+      Growth ($500K-$2M): Relaxed thresholds + stagnant+profit TP
+      Maturity (>$2M): Standard rules + trailing profit lock + momentum fading
     """
     n = len(mcap)
     entry_price = mcap[0]
     remaining = 1.0
     realized = 0.0
     peak_price = entry_price
+    peak_pnl = 0.0
     actions = []
 
     for t in range(n):
@@ -185,6 +333,7 @@ def run_lifecycle_strategy(mcap, volume, holders):
         current = mcap[t]
         pnl = (current - entry_price) / max(entry_price, 1)
         peak_price = max(peak_price, current)
+        peak_pnl = max(peak_pnl, pnl)
         drawdown_from_peak = (current - peak_price) / max(peak_price, 1)
 
         signals = compute_life_signals(mcap, volume, holders, t)
@@ -192,52 +341,129 @@ def run_lifecycle_strategy(mcap, volume, holders):
             continue
 
         action = None
+        phase = get_mcap_phase(current)
+        sp = compute_sell_pressure(signals, pnl, drawdown_from_peak, phase)
 
-        # Adaptive thresholds: during first 36h, require stronger signals
-        # (holder data is naturally noisy during launch)
-        early_phase = t < 24
-        decline_6h = 8 if early_phase else 6     # require 8h decline in early, 6h later
-        decline_12h = 15 if early_phase else 12  # require 15h in early, 12h later
-        decline_exit = 28 if early_phase else 24 # require 28h in early, 24h later
-        stagnant_profit = 0.70 if early_phase else 0.50
+        # ── Early Stage (<$500K): Hold with rug protection + dead token cut ──
+        if phase == "early":
+            if drawdown_from_peak < -0.80 and signals["declining_hours"] >= 12:
+                sell = remaining
+                realized += sell * current * (1 - SLIPPAGE) / entry_price * POSITION_SIZE - sell * POSITION_SIZE
+                action = "EXIT(rug-early)"
+                remaining = 0
 
-        # Rule 6: Rug protection — deep drawdown + holder declining
-        if drawdown_from_peak < -0.70 and not signals["holder_growing"]:
-            sell = remaining
-            realized += sell * current * (1 - SLIPPAGE) / entry_price * POSITION_SIZE - sell * POSITION_SIZE
-            action = "EXIT(rug)"
-            remaining = 0
+            # Dead token: holder declining 20h+ AND volume dead AND price tanking
+            elif (signals["declining_hours"] >= 20
+                    and signals["volume_trend"] < 0.3
+                    and signals["roc_12h"] < -0.15):
+                sell = remaining
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                action = "EXIT(dead-early)"
+                remaining = 0
 
-        # Rule 5: Holder declining → EXIT
-        elif signals["declining_hours"] >= decline_exit and remaining > 0:
-            sell = remaining
-            realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-            action = "EXIT(decline)"
-            remaining = 0
+        # ── Growth Stage ($500K-$2M): Relaxed 1.5x thresholds ──
+        elif phase == "growth":
+            if drawdown_from_peak < -0.70 and signals["declining_hours"] >= 6:
+                sell = remaining
+                realized += sell * current * (1 - SLIPPAGE) / entry_price * POSITION_SIZE - sell * POSITION_SIZE
+                action = "EXIT(rug-growth)"
+                remaining = 0
 
-        # Rule 4: Holder declining + volume shrinking → TP 40%
-        elif signals["declining_hours"] >= decline_12h and signals["volume_trend"] < 0.5:
-            sell = min(0.40, remaining)
-            realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-            remaining -= sell
-            action = "TP40%(decline+vol)"
+            elif signals["declining_hours"] >= 30:
+                sell = remaining
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                action = "EXIT(decline-growth)"
+                remaining = 0
 
-        # Rule 3: Holder declining → TP 25%
-        elif signals["declining_hours"] >= decline_6h:
-            sell = min(0.25, remaining)
-            realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-            remaining -= sell
-            action = "TP25%(decline)"
+            elif signals["declining_hours"] >= 15 and signals["volume_trend"] < 0.5:
+                sell = min(0.35, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP35%(decline+vol-growth)"
 
-        # Rule 2: Holder stagnating + profit → TP 20%
-        elif abs(signals["holder_trend"]) < 0.001 and pnl > stagnant_profit:
-            sell = min(0.20, remaining)
-            realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
-            remaining -= sell
-            action = "TP20%(stagnant)"
+            elif signals["declining_hours"] >= 8:
+                sell = min(0.20, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP20%(decline-growth)"
 
-        # Rule 1: Holder growing → HOLD
-        # (no action needed, default is hold)
+            # Holder stagnant + profit → TP 15% (core v2 rule)
+            elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.80:
+                sell = min(0.15, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP15%(stagnant-growth)"
+
+            # Multi-signal fading: lower profit bar but needs momentum confirmation
+            elif (abs(signals["holder_trend"]) < 0.001
+                    and pnl > 0.40
+                    and signals["roc_4h"] < -0.03
+                    and signals["price_vs_vwap"] < -0.05):
+                sell = min(0.15, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP15%(fade-growth)"
+
+        # ── Maturity Stage (>$2M): v2 base + enhanced signals ──
+        else:
+            # Rug protection
+            if drawdown_from_peak < -0.70 and not signals["holder_growing"]:
+                sell = remaining
+                realized += sell * current * (1 - SLIPPAGE) / entry_price * POSITION_SIZE - sell * POSITION_SIZE
+                action = "EXIT(rug-maturity)"
+                remaining = 0
+
+            # CORE: Holder declining 24h → EXIT (same as v2)
+            elif signals["declining_hours"] >= 24:
+                sell = remaining
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                action = "EXIT(decline-maturity)"
+                remaining = 0
+
+            # CORE: Holder declining 12h + volume dying → TP 40% (same as v2)
+            elif signals["declining_hours"] >= 12 and signals["volume_trend"] < 0.5:
+                sell = min(0.40, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP40%(decline+vol-maturity)"
+
+            # CORE: Holder declining 6h → TP 25% (same as v2)
+            elif signals["declining_hours"] >= 6:
+                sell = min(0.25, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP25%(decline-maturity)"
+
+            # NEW: Trailing profit lock — only after core rules pass
+            # Protect big gains when composite pressure is high
+            elif peak_pnl >= 5.0 and drawdown_from_peak < -0.35 and sp >= 0.35:
+                sell = min(0.40, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP40%(trailing-lock)"
+
+            elif peak_pnl >= 2.0 and drawdown_from_peak < -0.45 and sp >= 0.35:
+                sell = min(0.30, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP30%(trailing-lock)"
+
+            # NEW: Multi-signal momentum fading
+            elif (pnl > 0.80
+                    and signals["holder_accel"] < -0.003
+                    and signals["roc_4h"] < -0.02
+                    and signals["price_vs_vwap"] < -0.03):
+                sell = min(0.20, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP20%(fade-maturity)"
+
+            # CORE: Holder stagnant + profit → TP 20% (same as v2)
+            elif abs(signals["holder_trend"]) < 0.001 and pnl > 0.50:
+                sell = min(0.20, remaining)
+                realized += sell * pnl * POSITION_SIZE * (1 - SLIPPAGE)
+                remaining -= sell
+                action = "TP20%(stagnant-maturity)"
 
         if action:
             actions.append((t, action, remaining, pnl))
@@ -290,15 +516,15 @@ def run_fixed_strategy(mcap):
 
 def main():
     print("=" * 60)
-    print("Lifecycle Strategy — Holder-Based Position Management")
+    print("Lifecycle Strategy v3 — Phase-Based Position Management")
     print("=" * 60)
-    print("Rules:")
-    print("  Holder growing → HOLD (no matter what)")
-    print("  Holder stagnant + profit → TP 20%")
-    print("  Holder declining 6h → TP 25%")
-    print("  Holder declining 12h + volume dying → TP 40%")
-    print("  Holder declining 24h → EXIT")
-    print("  -70% from peak + holder declining → EXIT (rug)")
+    print("Phases:")
+    print("  Early (<$500K):  Pure hold, rug protection only")
+    print("  Growth ($500K-$2M): Relaxed thresholds (8h/15h/30h)")
+    print("  Maturity (>$2M):  Standard rules + trailing lock + momentum")
+    print("Signals:")
+    print("  Holder trend/accel/velocity, Volume trend/surge/dry")
+    print("  Price ROC(1/4/12h), VWAP deviation, Composite sell pressure")
     print()
 
     organic = load_organic_tokens()
