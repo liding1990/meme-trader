@@ -114,7 +114,20 @@ def score_candidate(address, baseline_df):
         baseline_df, "holder_roc", "holders_at_ath",
         feat.get("holder_roc", 0), feat.get("holders_at_ath", 0))
 
-    composite = np.mean(list(z_scores.values()))
+    # Weighted composite score based on empirical analysis:
+    # - 增长天花板 (r=0.71 with ATH): highest predictive power
+    # - holder吸引效率 (r=0.25): moderate, independent signal
+    # - 成交量真实性 (r=-0.45): inverse signal, moderate
+    # - 市值可持续性 (r=0.00): low predictive power
+    # - 价格-社区联动 (r=-0.43): redundant with 成交量真实性 (r=0.61 correlation)
+    weights = {
+        "z_growth_ceiling": 0.35,        # strongest predictor of ATH
+        "z_holder_efficiency": 0.25,     # independent, moderate signal
+        "z_volume_authenticity": 0.20,   # moderate but inverse
+        "z_mcap_sustainability": 0.10,   # weak predictor
+        "z_price_community": 0.10,       # redundant with volume_authenticity
+    }
+    composite = sum(z_scores[k] * weights[k] for k in weights)
 
     return {
         "feat": feat,

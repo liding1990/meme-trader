@@ -1142,6 +1142,17 @@ def section_candidate_monitor(df):
     st.markdown("基于 Regression 分析对 Candidate Pool 中的 token 实时评分排序。每小时自动更新。")
     st.code("PYTHONPATH=. python -m token_discovery.monitor --loop", language="bash")
 
+    with st.expander("评分权重说明"):
+        st.markdown("""
+        | 维度 | 权重 | ATH预测力 | 说明 |
+        |---|---|---|---|
+        | **增长天花板** | 35% | r=0.71 | Holder增速→最终Holder峰值，最强预测因子 |
+        | **Holder吸引效率** | 25% | r=0.25 | Volume→Holder转化率，独立信号 |
+        | **成交量真实性** | 20% | r=0.45 | Price→Volume关系，验证成交量真伪 |
+        | **市值可持续性** | 10% | r≈0 | ATH→Holders@ATH，弱预测力 |
+        | **价格-社区联动** | 10% | r=0.43 | 与成交量真实性冗余(r=0.61)，降权 |
+        """)
+
     scores = disc_db.get_scores()
 
     if not scores:
