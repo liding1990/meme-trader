@@ -964,6 +964,113 @@ def section_query(df, model):
         _render_regression_position(df, feat, symbol, rank)
 
 
+# ── Token Discovery: L1 Cluster Filter ───────────────────────────────────────
+
+
+def section_l1_filter(df, model):
+    """L1 漏斗：基于 Cluster 的第一层筛选。"""
+    st.markdown("## L1: Cluster 筛选")
+
+    st.markdown("""
+    ### 筛选逻辑
+
+    从全市场扫描到的 token 中，通过 Baseline Clustering v2 模型判断其所属 cluster。
+    **只有落入 Cluster #5 (Organic Runner) 或 #6 (Fast Organic) 的 token 才进入下一层。**
+
+    ```
+    全市场 Token
+        ↓ 计算 11 个生命周期特征
+        ↓ KMeans 预测 cluster
+        ↓ 仅保留 #5 和 #6
+    Candidate Pool（进入 L2 监测）
+    ```
+    """)
+
+    st.markdown("### 漏斗概览")
+
+    col1, col2, col3 = st.columns(3)
+
+    n_total = len(df)
+    n_organic = len(df[df["rank"].isin([5, 6])])
+    n_filtered = n_total - n_organic
+
+    col1.metric("总样本", f"{n_total}")
+    col2.metric("通过 L1（#5 + #6）", f"{n_organic}", f"{n_organic/n_total*100:.0f}%")
+    col3.metric("被过滤", f"{n_filtered}", f"{n_filtered/n_total*100:.0f}%")
+
+    # Cluster distribution
+    st.markdown("### 各 Cluster 分布")
+    dist_data = []
+    for rank in sorted(df["rank"].unique()):
+        meta = CLUSTER_META.get(rank, {})
+        n = len(df[df["rank"] == rank])
+        passed = "✅ 通过" if rank in [5, 6] else "❌ 过滤"
+        dist_data.append({
+            "#": rank,
+            "Cluster": meta.get("name", "?"),
+            "数量": n,
+            "占比": f"{n/n_total*100:.1f}%",
+            "L1 结果": passed,
+        })
+    st.dataframe(pd.DataFrame(dist_data), hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # Live test: input a token address
+    st.markdown("### 实时测试")
+    st.markdown("输入任意 token 地址，测试是否通过 L1 筛选。")
+
+    test_addr = st.text_input("合约地址", placeholder="输入 Solana token 地址...", key="l1_test_addr")
+
+    if test_addr and len(test_addr) > 20:
+        from baseline_cluster_v2 import build_feature_vector, compute_features
+
+        with st.spinner("获取数据并计算特征..."):
+            feat = compute_features(test_addr.strip())
+            if feat is None:
+                try:
+                    from gmgn_api import fetch_token_data
+                    fetch_token_data("sol", test_addr.strip())
+                    feat = compute_features(test_addr.strip())
+                except Exception as e:
+                    st.error(f"获取失败: {e}")
+
+        if feat is None:
+            st.warning("无法计算特征（数据不足或 ATH < $100K）")
+        else:
+            scaler = model["scaler"]
+            km = model["kmeans"]
+            cluster_order = model["cluster_order"]
+            rank_map = {c: i + 1 for i, c in enumerate(cluster_order)}
+
+            vec = scaler.transform([build_feature_vector(feat)])
+            cid = int(km.predict(vec)[0])
+            rank = rank_map.get(cid, 0)
+            meta = CLUSTER_META.get(rank, {})
+            color = meta.get("color", "#888")
+            passed = rank in [5, 6]
+
+            if passed:
+                st.success(f"✅ **通过 L1** → #{rank} {meta.get('name', '?')} — 进入 Candidate Pool")
+            else:
+                st.error(f"❌ **未通过 L1** → #{rank} {meta.get('name', '?')} — 被过滤")
+
+            st.markdown(f"""
+            | 指标 | 值 |
+            |---|---|
+            | Cluster | #{rank} {meta.get('name', '?')} |
+            | ATH | ${feat['ath']:,.0f} |
+            | 上升时长 | {feat['rise_hours']:.0f}h |
+            | 衰减时长 | {feat['decay_hours']:.0f}h |
+            | Holder@ATH | {feat['holders_at_ath']:,.0f} |
+            | 价格增速 | ${feat['price_roc']:,.0f}/h |
+            """)
+
+    st.divider()
+    st.markdown("### 后续步骤")
+    st.info("🚧 L2 进场信号（量化指标体系）和 L3 持仓监测将在下一阶段实现。")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -973,33 +1080,81 @@ if df is None:
     st.error("聚类数据未找到。请先运行 `python baseline_cluster_v2.py`。")
     st.stop()
 
-# Sidebar navigation
+# All pages in order, grouped by section
+ALL_PAGES = [
+    ("Baseline Cluster v2", "数据方法论"),
+    ("Baseline Cluster v2", "聚类结果"),
+    ("Baseline Cluster v2", "3D 轨迹图"),
+    ("Baseline Cluster v2", "散点分析"),
+    ("Baseline Cluster v2", "Regression 分析"),
+    ("Baseline Cluster v2", "Token 查询"),
+    ("Token Discovery", "L1: Cluster 筛选"),
+]
+
+# Sidebar
 with st.sidebar:
-    st.title("Baseline Clustering v2")
-    st.caption(f"{len(df)} tokens · 6 clusters · 2026年后")
+    st.title("Meme Trading System")
     st.divider()
-    page = st.radio("导航", [
-        "数据方法论",
-        "聚类结果",
-        "3D 轨迹图",
-        "散点分析",
-        "Regression 分析",
-        "Token 查询",
-    ], label_visibility="collapsed")
 
-# Title
-st.title("Baseline Clustering v2")
-st.caption("基于结果特征的 Memecoin 生命周期聚类 | 500 tokens · 6 clusters · 11 features")
+    st.markdown("##### Baseline Cluster v2")
+    st.caption(f"{len(df)} tokens · 6 clusters · 2026年后")
+    cluster_page = st.radio(
+        "cluster_nav",
+        ["数据方法论", "聚类结果", "3D 轨迹图", "散点分析", "Regression 分析", "Token 查询"],
+        label_visibility="collapsed",
+        key="cluster_page",
+    )
 
-if page == "数据方法论":
-    section_methodology()
-elif page == "聚类结果":
-    section_clusters(df)
-elif page == "3D 轨迹图":
-    section_3d_chart(df)
-elif page == "散点分析":
-    section_scatter(df)
-elif page == "Regression 分析":
-    section_regression(df)
-elif page == "Token 查询":
-    section_query(df, model)
+    st.divider()
+
+    st.markdown("##### Token Discovery")
+    st.caption("漏斗筛选 → 量化信号 → 进场")
+    discovery_page = st.radio(
+        "discovery_nav",
+        ["L1: Cluster 筛选"],
+        label_visibility="collapsed",
+        key="discovery_page",
+    )
+
+# Determine which section is active based on which radio was last clicked
+# Streamlit reruns on every interaction, so we track via session_state
+if "prev_cluster" not in st.session_state:
+    st.session_state.prev_cluster = cluster_page
+if "prev_discovery" not in st.session_state:
+    st.session_state.prev_discovery = discovery_page
+
+cluster_changed = cluster_page != st.session_state.prev_cluster
+discovery_changed = discovery_page != st.session_state.prev_discovery
+
+if discovery_changed:
+    active_section = "discovery"
+else:
+    active_section = "cluster"
+
+st.session_state.prev_cluster = cluster_page
+st.session_state.prev_discovery = discovery_page
+
+# Content
+if active_section == "cluster":
+    st.title("Baseline Clustering v2")
+    st.caption("基于结果特征的 Memecoin 生命周期聚类 | 500 tokens · 6 clusters · 11 features")
+
+    if cluster_page == "数据方法论":
+        section_methodology()
+    elif cluster_page == "聚类结果":
+        section_clusters(df)
+    elif cluster_page == "3D 轨迹图":
+        section_3d_chart(df)
+    elif cluster_page == "散点分析":
+        section_scatter(df)
+    elif cluster_page == "Regression 分析":
+        section_regression(df)
+    elif cluster_page == "Token 查询":
+        section_query(df, model)
+
+else:
+    st.title("Token Discovery")
+    st.caption("市场扫描 → Cluster 筛选 → 量化信号 → 进场")
+
+    if discovery_page == "L1: Cluster 筛选":
+        section_l1_filter(df, model)
