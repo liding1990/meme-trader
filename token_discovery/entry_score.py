@@ -1,0 +1,273 @@
+"""Entry Score — continuous scoring for candidate pool tokens.
+
+Computes a 0-100 entry score based on 5 weighted dimensions:
+  - Regression Quality (50%): from Candidate Monitor z-scores
+  - Momentum (15%): 4h price change
+  - Volume Surge (15%): recent vs average volume
+  - Buy Pressure (10%): buy/sell ratio
+  - Holder Momentum (10%): recent holder growth
+
+Usage:
+    PYTHONPATH=. python -m token_discovery.entry_score          # run once
+    PYTHONPATH=. python -m token_discovery.entry_score --loop   # run every 15 min
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from codex_api import _query, CODEX_API_KEY
+from token_discovery import db
+from token_discovery.pipeline import setup_logger
+
+ENTRY_INTERVAL = 15 * 60  # 15 minutes
+
+# Weights
+W_REGRESSION = 0.50
+W_MOMENTUM = 0.15
+W_VOLUME = 0.15
+W_BUY_PRESSURE = 0.10
+W_HOLDER_MOMENTUM = 0.10
+
+log = setup_logger()
+
+
+def fetch_realtime_stats(addresses):
+    """Fetch 4h stats for multiple tokens from Codex in one call."""
+    if not addresses or not CODEX_API_KEY:
+        return {}
+
+    # Codex filterTokens with specific token addresses
+    addr_list = ", ".join(f'"{a}"' for a in addresses[:50])  # batch limit
+
+    query = f'''
+    query {{
+      filterTokens(
+        tokens: [{addr_list}]
+        statsType: FILTERED
+        limit: 200
+      ) {{
+        results {{
+          volume4
+          volume24
+          change4
+          buyCount4
+          sellCount4
+          holders
+          token {{
+            address
+          }}
+        }}
+      }}
+    }}
+    '''
+
+    try:
+        result = _query(query)
+        tokens = result.get("filterTokens", {}).get("results", [])
+        stats = {}
+        for t in tokens:
+            addr = t.get("token", {}).get("address", "")
+            if addr:
+                stats[addr] = {
+                    "volume4": float(t.get("volume4", 0) or 0),
+                    "volume24": float(t.get("volume24", 0) or 0),
+                    "change4": float(t.get("change4", 0) or 0),
+                    "buyCount4": int(t.get("buyCount4", 0) or 0),
+                    "sellCount4": int(t.get("sellCount4", 0) or 0),
+                    "holders": int(t.get("holders", 0) or 0),
+                }
+        return stats
+    except Exception as e:
+        log.error(f"Codex batch fetch failed: {e}")
+        return {}
+
+
+def score_momentum(change4h):
+    """4h price change → 0-1 score. 0%=0, 50%+=1, negative=0."""
+    if change4h <= 0:
+        return 0.0
+    return min(change4h / 0.50, 1.0)  # 0-50% mapped to 0-1
+
+
+def score_volume_surge(vol4h, vol24h):
+    """Recent 4h volume vs average 4h volume → 0-1 score."""
+    avg_4h = vol24h / 6  # 24h / 6 = average 4h block
+    if avg_4h <= 0:
+        return 0.0
+    ratio = vol4h / avg_4h
+    # ratio 1x=0, 3x+=1
+    return min(max((ratio - 1) / 2, 0), 1.0)
+
+
+def score_buy_pressure(buy_count, sell_count):
+    """Buy/(buy+sell) ratio → 0-1 score. 0.5=0, 0.7+=1."""
+    total = buy_count + sell_count
+    if total == 0:
+        return 0.0
+    ratio = buy_count / total
+    # 0.5=0, 0.7=1
+    return min(max((ratio - 0.5) / 0.2, 0), 1.0)
+
+
+def score_holder_momentum(current_holders, discovery_holders):
+    """Holder growth since discovery → 0-1 score."""
+    if discovery_holders <= 0:
+        return 0.0
+    growth = (current_holders - discovery_holders) / discovery_holders
+    # 0%=0, 20%+=1
+    return min(max(growth / 0.20, 0), 1.0)
+
+
+def score_regression(composite_zscore):
+    """Regression z-score → 0-1 score. z=-1→0, z=0→0.5, z=1→1."""
+    return min(max((composite_zscore + 1) / 2, 0), 1.0)
+
+
+def run_once():
+    """Score all candidates for entry."""
+    log.info("=" * 50)
+    log.info("Entry Score computation starting")
+
+    db.init_db()
+
+    candidates = db.get_candidates()
+    scores_data = db.get_scores()
+
+    if not candidates:
+        log.info("No candidates in pool")
+        return
+
+    # Build regression score lookup
+    reg_scores = {}
+    for s in scores_data:
+        reg_scores[s["address"]] = s["composite_score"]
+
+    # Fetch real-time stats from Codex
+    addresses = [c["address"] for c in candidates]
+
+    # Batch in groups of 50
+    all_stats = {}
+    for i in range(0, len(addresses), 50):
+        batch = addresses[i:i+50]
+        stats = fetch_realtime_stats(batch)
+        all_stats.update(stats)
+        if i + 50 < len(addresses):
+            time.sleep(0.5)
+
+    log.info(f"Fetched real-time stats for {len(all_stats)}/{len(addresses)} tokens")
+
+    # Compute entry scores
+    results = []
+    for c in candidates:
+        addr = c["address"]
+        sym = c["symbol"]
+        stats = all_stats.get(addr, {})
+        reg_z = reg_scores.get(addr, 0)
+
+        # Individual dimension scores (0-1)
+        s_regression = score_regression(reg_z)
+        s_momentum = score_momentum(stats.get("change4", 0))
+        s_volume = score_volume_surge(stats.get("volume4", 0), stats.get("volume24", 0))
+        s_buy = score_buy_pressure(stats.get("buyCount4", 0), stats.get("sellCount4", 0))
+        s_holder = score_holder_momentum(stats.get("holders", 0), c["holders_at_discovery"])
+
+        # Weighted composite (0-100)
+        entry_score = (
+            s_regression * W_REGRESSION +
+            s_momentum * W_MOMENTUM +
+            s_volume * W_VOLUME +
+            s_buy * W_BUY_PRESSURE +
+            s_holder * W_HOLDER_MOMENTUM
+        ) * 100
+
+        results.append({
+            "address": addr,
+            "symbol": sym,
+            "entry_score": round(entry_score, 1),
+            "s_regression": round(s_regression, 3),
+            "s_momentum": round(s_momentum, 3),
+            "s_volume": round(s_volume, 3),
+            "s_buy": round(s_buy, 3),
+            "s_holder": round(s_holder, 3),
+            "change4h": stats.get("change4", 0),
+            "vol4h": stats.get("volume4", 0),
+            "holders": stats.get("holders", 0),
+            "reg_z": reg_z,
+        })
+
+    # Sort by entry score
+    results.sort(key=lambda x: -x["entry_score"])
+
+    # Save to DB
+    conn = db.get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS entry_scores (
+            address TEXT PRIMARY KEY,
+            symbol TEXT,
+            updated_at TEXT,
+            entry_score REAL DEFAULT 0,
+            s_regression REAL DEFAULT 0,
+            s_momentum REAL DEFAULT 0,
+            s_volume REAL DEFAULT 0,
+            s_buy REAL DEFAULT 0,
+            s_holder REAL DEFAULT 0,
+            change4h REAL DEFAULT 0,
+            vol4h REAL DEFAULT 0,
+            holders INTEGER DEFAULT 0,
+            reg_z REAL DEFAULT 0
+        )
+    """)
+    now = datetime.now(timezone.utc).isoformat()
+    for r in results:
+        conn.execute("""
+            INSERT OR REPLACE INTO entry_scores (
+                address, symbol, updated_at, entry_score,
+                s_regression, s_momentum, s_volume, s_buy, s_holder,
+                change4h, vol4h, holders, reg_z
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (r["address"], r["symbol"], now, r["entry_score"],
+              r["s_regression"], r["s_momentum"], r["s_volume"],
+              r["s_buy"], r["s_holder"],
+              r["change4h"], r["vol4h"], r["holders"], r["reg_z"]))
+    conn.commit()
+    conn.close()
+
+    # Log results
+    log.info(f"\nEntry Score Rankings ({len(results)} candidates):")
+    for i, r in enumerate(results[:15]):
+        log.info(f"  {i+1:>2d}. {r['symbol']:>12s}  score={r['entry_score']:>5.1f}  "
+                 f"reg={r['s_regression']:.2f} mom={r['s_momentum']:.2f} "
+                 f"vol={r['s_volume']:.2f} buy={r['s_buy']:.2f} hold={r['s_holder']:.2f}")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Entry Score")
+    parser.add_argument("--loop", action="store_true")
+    args = parser.parse_args()
+
+    if args.loop:
+        log.info(f"Starting entry score loop (interval: {ENTRY_INTERVAL}s)")
+        while True:
+            try:
+                run_once()
+            except Exception as e:
+                log.error(f"Entry score error: {e}")
+                import traceback
+                traceback.print_exc()
+            time.sleep(ENTRY_INTERVAL)
+    else:
+        run_once()
+
+
+if __name__ == "__main__":
+    main()

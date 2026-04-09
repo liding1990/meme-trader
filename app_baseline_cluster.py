@@ -1246,6 +1246,111 @@ def section_candidate_monitor(df):
         st.plotly_chart(fig, use_container_width=True)
 
 
+def section_entry_score():
+    """Entry Score — ranked candidates with dimension breakdown."""
+    from token_discovery import db as disc_db
+    disc_db.init_db()
+
+    st.markdown("## Entry Score")
+    st.markdown("基于 5 个维度对 Candidate 进行连续评分（0-100），排名越高越适合入场。")
+    st.code("PYTHONPATH=. python -m token_discovery.entry_score --loop", language="bash")
+
+    with st.expander("评分权重"):
+        st.markdown("""
+        | 维度 | 权重 | 计算方式 | 性质 |
+        |---|---|---|---|
+        | **Regression 质量** | 50% | Candidate Monitor 综合 z-score 归一化 | 结构性（全周期） |
+        | **动量强度** | 15% | 4h 涨幅归一化 (0%→0, 50%→1) | 短期趋势 |
+        | **放量程度** | 15% | 近4h vol / 24h均值4h vol (1x→0, 3x→1) | 短期成交量 |
+        | **买卖压力** | 10% | buy/(buy+sell) 比例 (0.5→0, 0.7→1) | 短期方向 |
+        | **Holder 动量** | 10% | 当前holders vs发现时holders增长率 (0%→0, 20%→1) | 短期社区 |
+        """)
+
+    # Load entry scores from DB
+    conn = disc_db.get_conn()
+    try:
+        rows = conn.execute("SELECT * FROM entry_scores ORDER BY entry_score DESC").fetchall()
+    except Exception:
+        rows = []
+    conn.close()
+
+    if not rows:
+        st.info("暂无 Entry Score 数据。运行 `PYTHONPATH=. python -m token_discovery.entry_score` 生成。")
+        return
+
+    edf = pd.DataFrame([dict(r) for r in rows])
+
+    # Top metrics
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Candidates", f"{len(edf)}")
+    col2.metric("最高分", f"{edf['entry_score'].max():.1f}")
+    col3.metric("中位分", f"{edf['entry_score'].median():.1f}")
+
+    # Ranked table with dimension bars
+    st.markdown("### 排名")
+
+    table_rows = []
+    for i, (_, r) in enumerate(edf.iterrows()):
+        table_rows.append({
+            "排名": i + 1,
+            "Token": r["symbol"],
+            "Entry Score": f"{r['entry_score']:.1f}",
+            "Regression (50%)": f"{r['s_regression']:.2f}",
+            "动量 (15%)": f"{r['s_momentum']:.2f}",
+            "放量 (15%)": f"{r['s_volume']:.2f}",
+            "买压 (10%)": f"{r['s_buy']:.2f}",
+            "Holder (10%)": f"{r['s_holder']:.2f}",
+            "4h涨幅": f"{r['change4h']*100:+.1f}%",
+            "Vol 4h": f"${r['vol4h']:,.0f}",
+            "更新": r["updated_at"][:16] if r["updated_at"] else "",
+        })
+    st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
+
+    # Dimension breakdown chart for top 10
+    st.divider()
+    st.markdown("### Top 10 维度分解")
+
+    top10 = edf.head(10)
+    if len(top10) > 0:
+        fig = go.Figure()
+        dims = [
+            ("s_regression", "Regression (50%)", "#ef4444"),
+            ("s_momentum", "动量 (15%)", "#f59e0b"),
+            ("s_volume", "放量 (15%)", "#3b82f6"),
+            ("s_buy", "买压 (10%)", "#22c55e"),
+            ("s_holder", "Holder (10%)", "#a855f7"),
+        ]
+        weights = [0.50, 0.15, 0.15, 0.10, 0.10]
+
+        for (col, name, color), w in zip(dims, weights):
+            fig.add_trace(go.Bar(
+                y=top10["symbol"],
+                x=top10[col] * w * 100,
+                name=name,
+                orientation="h",
+                marker_color=color,
+            ))
+
+        fig.update_layout(
+            barmode="stack",
+            title="Entry Score 组成（加权）",
+            xaxis_title="Score",
+            yaxis=dict(autorange="reversed"),
+            height=400,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Score distribution
+    st.markdown("### 分数分布")
+    fig_hist = px.histogram(edf, x="entry_score", nbins=20,
+                             title=f"Entry Score 分布（{len(edf)} candidates）",
+                             labels={"entry_score": "Entry Score"},
+                             color_discrete_sequence=["#3b82f6"])
+    fig_hist.update_layout(height=300)
+    st.plotly_chart(fig_hist, use_container_width=True)
+
+
 # Navigation via styled buttons as menu items
 MENU = {
     "Baseline Cluster v2": {
@@ -1254,7 +1359,7 @@ MENU = {
     },
     "Token Discovery": {
         "caption": "漏斗筛选 → 量化信号 → 进场",
-        "pages": ["L1: Cluster 筛选", "Candidate Monitor"],
+        "pages": ["L1: Cluster 筛选", "Candidate Monitor", "Entry Score"],
     },
 }
 
@@ -1333,3 +1438,5 @@ elif page in DISCOVERY_PAGES:
         section_l1_filter(df, model)
     elif page == "Candidate Monitor":
         section_candidate_monitor(df)
+    elif page == "Entry Score":
+        section_entry_score()
