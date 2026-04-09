@@ -1,0 +1,527 @@
+"""Baseline Clustering v2 — 交互式展示页面
+
+展示 6 个 outcome cluster 的完整分析：数据选取方法、聚类结果、3D 可视化、Token 查询。
+
+Usage:
+    streamlit run app_baseline_cluster.py --server.port 8530
+"""
+
+import csv
+import glob
+import json
+import os
+import pickle
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+import streamlit as st
+
+st.set_page_config(page_title="Baseline Clustering v2", layout="wide")
+
+DATA_DIR = "data"
+CLUSTER_DIR = "baseline_cluster_v2_data"
+CLUSTER_CSV = os.path.join(CLUSTER_DIR, "clusters.csv")
+MODEL_PKL = os.path.join(CLUSTER_DIR, "model.pkl")
+
+CLUSTER_META = {
+    1: {
+        "name": "Fake / Scam Token",
+        "name_cn": "假币 / 仿冒币",
+        "color": "#6b7280",
+        "desc": "ATH 数十亿但 holder 仅 0-1。全是 unicode 仿冒币（伪造 SOL、USDT 等），假 mcap，"
+                "无真实交易量，无真实社区。应直接过滤。",
+        "traits": ["ATH 虚高（中位 $2.6B）", "Holder 为 0-1", "Unicode 仿冒知名 token", "无真实交易"],
+    },
+    2: {
+        "name": "Pump & Dump",
+        "name_cn": "拉盘砸盘",
+        "color": "#ef4444",
+        "desc": "1 小时拉盘 + 1 小时崩盘的极端快进快出模式。有真人参与（~1.7K holder），"
+                "但多数是追高被套。典型的事件驱动型，蹭热点后瞬间归零。",
+        "traits": ["上升+衰减共 ~2h", "价格增速极高 ($1.8M/h)", "有真人参与 (~1.7K holders)", "事件驱动型"],
+    },
+    3: {
+        "name": "Ghost Pump",
+        "name_cn": "幽灵拉盘（无社区）",
+        "color": "#a855f7",
+        "desc": "有 mcap 增长但 holder = 0。纯合约操纵、LP 刷量或 holder 数据缺失。"
+                "上升 14h 但衰减仅 3h，拉完就跑，没有任何社区基础。",
+        "traits": ["Holder@ATH = 0", "纯合约 / LP 操纵", "上升 14h / 衰减 3h", "无社区基础"],
+    },
+    4: {
+        "name": "Slow Bleed",
+        "name_cn": "慢性归零",
+        "color": "#f97316",
+        "desc": "涨上去后花 20+ 天缓慢归零。上升仅占 4.6% 的生命周期，绝大部分时间在阴跌。"
+                "有 holder 但社区停滞，增长速度为 0。最痛苦的一类——给人希望又慢慢磨灭。",
+        "traits": ["衰减时长中位 479h (~20天)", "上升占比仅 4.6%", "Holder 增长停滞", "漫长阴跌"],
+    },
+    5: {
+        "name": "Organic Runner",
+        "name_cn": "社区驱动长线",
+        "color": "#22c55e",
+        "desc": "上升时长中位 372h（~15 天），慢慢积累型。PUNCH、WAR、WOJAK 都在这里。"
+                "有真实持币社区，增长缓慢但持续。是真正由社区共识驱动的 token。",
+        "traits": ["上升 ~15 天", "有真实社区 (1.7K+ holders)", "缓慢但持续的增长", "PUNCH/WAR/WOJAK"],
+    },
+    6: {
+        "name": "Fast Organic",
+        "name_cn": "快速爆发型",
+        "color": "#3b82f6",
+        "desc": "生命周期 ~1.5 天。Holder 增速 116/h 是所有 cluster 中最高——真实社区快速涌入但也快速散场。"
+                "BFS、PENGUIN、CityBoy 在这里。爆发力强但持续性不足。",
+        "traits": ["上升 16h / 衰减 18h", "Holder 增速最高 (116/h)", "真实社区 + 快速爆发", "BFS/PENGUIN/CityBoy"],
+    },
+}
+
+
+# ── Data Loading ─────────────────────────────────────────────────────────────
+
+
+@st.cache_data
+def load_cluster_data():
+    if not os.path.isfile(CLUSTER_CSV):
+        return None, None
+    df = pd.read_csv(CLUSTER_CSV)
+    with open(MODEL_PKL, "rb") as f:
+        model = pickle.load(f)
+    return df, model
+
+
+@st.cache_data
+def load_trajectories(addresses):
+    """Load hourly mcap + holder trajectories for 3D visualization."""
+    trajectories = {}
+    for addr in addresses:
+        data_dir = os.path.join(DATA_DIR, addr)
+        h_files = sorted([f for f in glob.glob(os.path.join(data_dir, "token_mcap_candles_[0-9]*.json"))
+                           if "5m" not in os.path.basename(f)])
+        if not h_files:
+            continue
+        try:
+            with open(h_files[-1]) as f:
+                data = json.load(f)
+            candles = (data or {}).get("data", {}).get("list", [])
+            if not candles or len(candles) < 2:
+                continue
+            cdf = pd.DataFrame(candles)
+            cdf["mcap"] = cdf["close"].astype(float)
+            cdf["volume"] = cdf["volume"].astype(float)
+            cdf["datetime"] = pd.to_datetime(cdf["time"].astype(int), unit="ms")
+            cdf = cdf.sort_values("datetime").reset_index(drop=True)
+
+            # Window: first $100K → end
+            above = cdf[cdf["mcap"] >= 100000]
+            if above.empty:
+                continue
+            start = above.index[0]
+            cdf = cdf.loc[start:].reset_index(drop=True)
+            t0 = cdf["datetime"].iloc[0]
+            cdf["hours"] = (cdf["datetime"] - t0).dt.total_seconds() / 3600
+
+            # Load holders
+            moralis = os.path.join(data_dir, "moralis_holders_1h.json")
+            cdf["holders"] = 0
+            if os.path.isfile(moralis):
+                try:
+                    with open(moralis) as f:
+                        hdata = json.load(f)
+                    if hdata:
+                        hdf = pd.DataFrame(hdata)
+                        hdf["datetime"] = pd.to_datetime(hdf["timestamp"], utc=True).dt.tz_localize(None)
+                        hdf["holders"] = hdf["totalHolders"].astype(float)
+                        hdf = hdf.set_index("datetime").resample("1h").last().ffill().reset_index()
+                        merged = pd.merge_asof(cdf[["datetime", "mcap", "volume", "hours"]],
+                                                hdf[["datetime", "holders"]], on="datetime", direction="backward")
+                        if "holders" in merged.columns:
+                            cdf = merged
+                except Exception:
+                    pass
+
+            trajectories[addr] = cdf
+        except Exception:
+            continue
+    return trajectories
+
+
+# ── Page Sections ────────────────────────────────────────────────────────────
+
+
+def section_methodology():
+    """数据选取方法论。"""
+    st.markdown("## 数据选取方法")
+
+    st.markdown("""
+    ### 数据窗口定义
+
+    对每个 token，我们定义了一个标准化的生命周期窗口：
+    """)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("""
+        **起点**
+        - 市值首次达到 **$100K** 的时刻
+        - $100K 之前的数据丢弃（噪音阶段）
+        """)
+    with col2:
+        st.markdown("""
+        **峰值 (ATH)**
+        - 窗口内市值最高点
+        - 起点 → ATH = **上升阶段**
+        """)
+    with col3:
+        st.markdown("""
+        **截止点**
+        - 从 ATH 下跌 **70%** 的第一个时刻
+        - ATH → 截止 = **衰减阶段**
+        - 若未跌 70% 则取数据末尾
+        """)
+
+    st.markdown("""
+    ```
+    $100K ════ 上升阶段 ════ ATH ════ 衰减阶段 ════ ATH × 30%
+     起点                    峰值                   截止（跌70%）
+    ```
+    """)
+
+    st.markdown("""
+    ### 过滤条件
+    - **Token 创建时间 > 2026 年 1 月 1 日**（排除旧周期 token）
+    - **ATH >= $100K**（排除从未有过实质市值的 token）
+    - **数据来源：GMGN 小时级蜡烛图**（close = 市值）
+    """)
+
+    st.markdown("""
+    ### 11 个聚类特征
+
+    | 阶段 | 特征 | 含义 |
+    |---|---|---|
+    | 上升 | `rise_hours` | 从 $100K 到 ATH 的时长 |
+    | 上升 | `price_roc` | 价格增速 ($/h) |
+    | 上升 | `volume_roc` | 成交量增速 ($/h) |
+    | 上升 | `holder_roc` | 持币人增速 (/h) |
+    | 峰值 | `ath` | 历史最高市值 |
+    | 峰值 | `holders_at_ath` | ATH 时持币人数 |
+    | 衰减 | `decay_hours` | 从 ATH 到跌 70% 的时长 |
+    | 衰减 | `holder_decay_roc` | 持币人流失速度 (/h) |
+    | 衰减 | `price_decay_roc` | 价格衰减速度 ($/h) |
+    | 时间 | `total_hours` | 完整周期时长 |
+    | 时间 | `rise_pct` | 上升阶段占比 |
+    """)
+
+
+def section_clusters(df):
+    """6 个 Cluster 详细展示。"""
+    st.markdown("## 聚类结果")
+
+    cluster_order = sorted(df["rank"].unique())
+    cid_by_rank = {int(df[df["rank"] == r]["cluster_id"].iloc[0]): r for r in cluster_order}
+    rank_by_cid = {v: k for k, v in cid_by_rank.items()}
+
+    st.markdown(f"**{len(df)} 个 token，6 个聚类**（KMeans, log-scaled, StandardScaler）")
+
+    # Overview table
+    overview_rows = []
+    for rank in cluster_order:
+        meta = CLUSTER_META.get(rank, {})
+        sub = df[df["rank"] == rank]
+        overview_rows.append({
+            "#": rank,
+            "名称": meta.get("name", "?"),
+            "中文": meta.get("name_cn", "?"),
+            "数量": len(sub),
+            "ATH 中位": f"${sub['ath'].median():,.0f}",
+            "上升时长": f"{sub['rise_hours'].median():.0f}h",
+            "衰减时长": f"{sub['decay_hours'].median():.0f}h",
+            "Holder@ATH": f"{sub['holders_at_ath'].median():,.0f}",
+        })
+    st.dataframe(pd.DataFrame(overview_rows), hide_index=True, use_container_width=True)
+
+    # Detailed cards
+    for rank in cluster_order:
+        meta = CLUSTER_META.get(rank, {})
+        sub = df[df["rank"] == rank]
+        color = meta.get("color", "#888")
+
+        st.markdown(f"""
+        <div style="border-left: 5px solid {color}; padding: 12px 16px; margin: 16px 0; background: {color}10;">
+            <h3 style="color: {color}; margin: 0;">#{rank} {meta.get('name', '?')} — {meta.get('name_cn', '?')} ({len(sub)} tokens)</h3>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(meta.get("desc", ""))
+
+        # Traits as tags
+        traits = meta.get("traits", [])
+        if traits:
+            tags_html = " ".join(
+                f'<span style="background:{color}20; color:{color}; padding:2px 8px; '
+                f'border-radius:12px; font-size:0.85em; margin-right:4px;">{t}</span>'
+                for t in traits
+            )
+            st.markdown(tags_html, unsafe_allow_html=True)
+
+        # Stats columns
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("ATH 中位", f"${sub['ath'].median():,.0f}")
+        col2.metric("上升时长", f"{sub['rise_hours'].median():.0f}h")
+        col3.metric("衰减时长", f"{sub['decay_hours'].median():.0f}h")
+        col4.metric("Holder@ATH", f"{sub['holders_at_ath'].median():,.0f}")
+
+        col5, col6, col7, col8 = st.columns(4)
+        col5.metric("价格增速", f"${sub['price_roc'].median():,.0f}/h")
+        col6.metric("Volume增速", f"${sub['volume_roc'].median():,.0f}/h")
+        col7.metric("Holder增速", f"{sub['holder_roc'].median():.1f}/h")
+        col8.metric("上升占比", f"{sub['rise_pct'].median():.0%}")
+
+        # Sample tokens table
+        with st.expander(f"查看 #{rank} 全部 {len(sub)} 个 token"):
+            display = sub.sort_values("ath", ascending=False)[
+                ["symbol", "ath", "rise_hours", "decay_hours", "holders_at_ath",
+                 "price_roc", "holder_roc", "total_hours", "rise_pct"]
+            ].copy()
+            display.columns = ["Token", "ATH", "上升(h)", "衰减(h)", "Holder@ATH",
+                               "价格增速($/h)", "Holder增速(/h)", "总时长(h)", "上升占比"]
+            display["ATH"] = display["ATH"].apply(lambda x: f"${x:,.0f}")
+            display["价格增速($/h)"] = display["价格增速($/h)"].apply(lambda x: f"${x:,.0f}")
+            display["上升占比"] = display["上升占比"].apply(lambda x: f"{x:.0%}")
+            st.dataframe(display, hide_index=True, use_container_width=True)
+
+
+def section_3d_chart(df):
+    """3D 轨迹可视化。"""
+    st.markdown("## 3D 轨迹可视化")
+    st.markdown("*每条线是一个 token 从 $100K 开始的生命轨迹，按 cluster 着色。*")
+
+    # Cluster filter
+    cluster_order = sorted(df["rank"].unique())
+    options = {f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}": r for r in cluster_order}
+    selected = st.multiselect("选择显示的 Cluster", list(options.keys()),
+                               default=[k for k, v in options.items() if v not in [1]],  # hide fake by default
+                               key="cluster_3d_filter")
+    selected_ranks = [options[s] for s in selected]
+
+    # Load trajectories
+    addrs = df[df["rank"].isin(selected_ranks)]["address"].tolist()
+    trajectories = load_trajectories(addrs[:200])  # cap at 200 for performance
+
+    if not trajectories:
+        st.warning("无轨迹数据")
+        return
+
+    # Build rank lookup
+    addr_rank = dict(zip(df["address"], df["rank"]))
+
+    fig = go.Figure()
+    for addr, traj in trajectories.items():
+        rank = addr_rank.get(addr, 0)
+        if rank not in selected_ranks:
+            continue
+
+        meta = CLUSTER_META.get(rank, {})
+        color = meta.get("color", "#999")
+        name_label = meta.get("name", "?")
+        symbol = df[df["address"] == addr]["symbol"].iloc[0] if addr in df["address"].values else "?"
+        width = 3 if rank in [5, 6] else 2 if rank in [2, 4] else 1
+
+        fig.add_trace(go.Scatter3d(
+            x=traj["hours"], y=traj["mcap"],
+            z=traj["holders"] if "holders" in traj.columns else [0] * len(traj),
+            mode="lines",
+            line=dict(color=color, width=width),
+            text=[
+                f"<b>{symbol}</b><br>#{rank} {name_label}<br>"
+                f"T+{row['hours']:.0f}h<br>MCap: ${row['mcap']:,.0f}<br>"
+                f"Holders: {row.get('holders', 0):,.0f}"
+                for _, row in traj.iterrows()
+            ],
+            hoverinfo="text",
+            name=f"{symbol}",
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="时间（小时）",
+            yaxis_title="市值 ($)",
+            zaxis_title="持币人数",
+            xaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+            yaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)", type="log"),
+            zaxis=dict(backgroundcolor="white", gridcolor="rgb(200,200,200)"),
+            bgcolor="white",
+        ),
+        paper_bgcolor="white",
+        font=dict(color="black"),
+        height=700,
+        margin=dict(l=0, r=0, t=10, b=0),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Legend
+    legend_cols = st.columns(len(selected_ranks))
+    for i, rank in enumerate(selected_ranks):
+        meta = CLUSTER_META.get(rank, {})
+        color = meta.get("color", "#999")
+        n = len(df[df["rank"] == rank])
+        legend_cols[i].markdown(
+            f'<span style="color:{color}; font-weight:bold;">&#9632;</span> '
+            f'#{rank} {meta.get("name", "?")} ({n})',
+            unsafe_allow_html=True
+        )
+
+
+def section_scatter(df):
+    """2D 散点图。"""
+    st.markdown("## 特征散点分析")
+
+    col_x, col_y = st.columns(2)
+    feature_options = {
+        "ATH ($)": "ath",
+        "上升时长 (h)": "rise_hours",
+        "衰减时长 (h)": "decay_hours",
+        "价格增速 ($/h)": "price_roc",
+        "Holder@ATH": "holders_at_ath",
+        "Holder增速 (/h)": "holder_roc",
+        "总时长 (h)": "total_hours",
+        "上升占比": "rise_pct",
+        "Volume增速 ($/h)": "volume_roc",
+    }
+    x_label = col_x.selectbox("X 轴", list(feature_options.keys()), index=0, key="scatter_x")
+    y_label = col_y.selectbox("Y 轴", list(feature_options.keys()), index=4, key="scatter_y")
+    x_col = feature_options[x_label]
+    y_col = feature_options[y_label]
+
+    plot_df = df.copy()
+    plot_df["cluster_name"] = plot_df["rank"].map(lambda r: f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}")
+    color_map = {f"#{r} {CLUSTER_META.get(r, {}).get('name', '?')}": CLUSTER_META.get(r, {}).get("color", "#999")
+                 for r in sorted(df["rank"].unique())}
+
+    log_x = x_col in ("ath", "price_roc", "volume_roc", "rise_hours", "decay_hours", "total_hours")
+    log_y = y_col in ("ath", "price_roc", "volume_roc", "rise_hours", "decay_hours", "total_hours")
+
+    fig = px.scatter(plot_df, x=x_col, y=y_col, color="cluster_name",
+                      hover_name="symbol", log_x=log_x, log_y=log_y,
+                      color_discrete_map=color_map,
+                      labels={x_col: x_label, y_col: y_label, "cluster_name": "Cluster"},
+                      title=f"{x_label} vs {y_label}")
+    fig.update_layout(height=500)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def section_query(df, model):
+    """Token 查询。"""
+    st.markdown("## Token 查询")
+    st.markdown("输入 token symbol 或地址，查看其所属 cluster。")
+
+    query = st.text_input("Token Symbol 或地址", placeholder="例如: PUNCH, BFS, 或合约地址...",
+                           key="cluster_query")
+    if not query:
+        return
+
+    query_lower = query.strip().lower()
+    match = df[df["symbol"].str.lower() == query_lower]
+    if match.empty:
+        match = df[df["address"].str.lower() == query_lower]
+    if match.empty:
+        match = df[df["symbol"].str.lower().str.contains(query_lower, na=False)]
+
+    if match.empty:
+        st.warning(f"未找到「{query}」。仅支持查询数据集中的 token。")
+        return
+
+    row = match.iloc[0]
+    rank = int(row["rank"])
+    meta = CLUSTER_META.get(rank, {})
+    color = meta.get("color", "#888")
+    same_cluster = df[df["rank"] == rank]
+
+    st.markdown(f"""
+    <div style="border-left: 5px solid {color}; padding: 12px 16px; margin: 16px 0; background: {color}10;">
+        <h3 style="margin:0;">{row['symbol']} → <span style="color:{color};">#{rank} {meta.get('name', '?')}</span></h3>
+        <p style="margin:4px 0 0 0; color: #666;">{meta.get('name_cn', '')}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Token features
+    col1, col2, col3 = st.columns(3)
+    col1.metric("ATH", f"${row['ath']:,.0f}")
+    col1.metric("价格增速", f"${row['price_roc']:,.0f}/h")
+    col2.metric("上升时长", f"{row['rise_hours']:.0f}h")
+    col2.metric("衰减时长", f"{row['decay_hours']:.0f}h")
+    col3.metric("Holder@ATH", f"{row['holders_at_ath']:,.0f}")
+    col3.metric("Holder增速", f"{row['holder_roc']:.1f}/h")
+
+    # Same cluster stats
+    st.markdown(f"### 同 Cluster 对比（#{rank} {meta.get('name', '?')}, {len(same_cluster)} tokens）")
+    compare = pd.DataFrame({
+        "指标": ["ATH", "上升时长", "衰减时长", "Holder@ATH", "价格增速"],
+        "该 Token": [
+            f"${row['ath']:,.0f}", f"{row['rise_hours']:.0f}h", f"{row['decay_hours']:.0f}h",
+            f"{row['holders_at_ath']:,.0f}", f"${row['price_roc']:,.0f}/h"
+        ],
+        "Cluster 中位": [
+            f"${same_cluster['ath'].median():,.0f}", f"{same_cluster['rise_hours'].median():.0f}h",
+            f"{same_cluster['decay_hours'].median():.0f}h",
+            f"{same_cluster['holders_at_ath'].median():,.0f}",
+            f"${same_cluster['price_roc'].median():,.0f}/h"
+        ],
+    })
+    st.dataframe(compare, hide_index=True)
+
+    # Similar tokens
+    from baseline_cluster_v2 import build_feature_vector
+    scaler = model["scaler"]
+    query_vec = scaler.transform([build_feature_vector(row)])
+    member_vecs = scaler.transform([build_feature_vector(r) for _, r in same_cluster.iterrows()])
+    dists = np.sqrt(((member_vecs - query_vec[0]) ** 2).sum(axis=1))
+    same_cluster = same_cluster.copy()
+    same_cluster["distance"] = dists
+    similar = same_cluster[same_cluster["symbol"] != row["symbol"]].nsmallest(8, "distance")
+
+    st.markdown("### 最相似 Token")
+    sim_display = similar[["symbol", "ath", "rise_hours", "decay_hours", "holders_at_ath", "distance"]].copy()
+    sim_display.columns = ["Token", "ATH", "上升(h)", "衰减(h)", "Holder@ATH", "距离"]
+    sim_display["ATH"] = sim_display["ATH"].apply(lambda x: f"${x:,.0f}")
+    sim_display["距离"] = sim_display["距离"].apply(lambda x: f"{x:.2f}")
+    st.dataframe(sim_display, hide_index=True)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+
+df, model = load_cluster_data()
+
+if df is None:
+    st.error("聚类数据未找到。请先运行 `python baseline_cluster_v2.py`。")
+    st.stop()
+
+# Sidebar navigation
+with st.sidebar:
+    st.title("Baseline Clustering v2")
+    st.caption(f"{len(df)} tokens · 6 clusters · 2026年后")
+    st.divider()
+    page = st.radio("导航", [
+        "数据方法论",
+        "聚类结果",
+        "3D 轨迹图",
+        "散点分析",
+        "Token 查询",
+    ], label_visibility="collapsed")
+
+# Title
+st.title("Baseline Clustering v2")
+st.caption("基于结果特征的 Memecoin 生命周期聚类 | 500 tokens · 6 clusters · 11 features")
+
+if page == "数据方法论":
+    section_methodology()
+elif page == "聚类结果":
+    section_clusters(df)
+elif page == "3D 轨迹图":
+    section_3d_chart(df)
+elif page == "散点分析":
+    section_scatter(df)
+elif page == "Token 查询":
+    section_query(df, model)
