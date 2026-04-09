@@ -1,3 +1,7 @@
-"""Run: PYTHONPATH=. python -m token_discovery [--loop]"""
-from token_discovery.pipeline import main
+"""Unified Token Discovery daemon.
+
+Usage:
+    PYTHONPATH=. python -m token_discovery
+"""
+from token_discovery.run import main
 main()
