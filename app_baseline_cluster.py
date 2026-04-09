@@ -1639,7 +1639,11 @@ MENU = {
     },
     "Token Discovery": {
         "caption": "漏斗筛选 → 量化信号 → 进场",
-        "pages": ["L1: Cluster 筛选", "Candidate Monitor", "持仓管理"],
+        "pages": ["L1: Cluster 筛选", "Candidate Monitor"],
+    },
+    "Position Management": {
+        "caption": "Lifecycle v3 · 阶段管理 · 复合信号",
+        "pages": ["Strategy"],
     },
 }
 
@@ -1692,6 +1696,7 @@ page = st.session_state.page
 # Content routing
 CLUSTER_PAGES = MENU["Baseline Cluster v2"]["pages"]
 DISCOVERY_PAGES = MENU["Token Discovery"]["pages"]
+POSITION_PAGES = MENU["Position Management"]["pages"]
 
 if page in CLUSTER_PAGES:
     st.title("Baseline Clustering v2")
@@ -1718,5 +1723,10 @@ elif page in DISCOVERY_PAGES:
         section_l1_filter(df, model)
     elif page == "Candidate Monitor":
         section_candidate_monitor(df)
-    elif page == "持仓管理":
+
+elif page in POSITION_PAGES:
+    st.title("Position Management")
+    st.caption("Lifecycle v3 · 阶段管理 · 复合信号 · 248 tokens 回测")
+
+    if page == "Strategy":
         section_position_management()
