@@ -1394,14 +1394,29 @@ def section_position_management():
     # Load data
     from token_discovery.lifecycle_strategy import load_token_data, run_lifecycle_strategy, run_fixed_strategy, compute_life_signals
 
+    # Entry MCap input
+    entry_mcap = st.number_input("入场市值 ($)", min_value=50000, max_value=100000000,
+                                  value=100000, step=50000, key="entry_mcap_input",
+                                  help="Token 市值首次达到此值时入场。默认 $100K。")
+
     data = load_token_data(addr)
     if data is None:
         st.warning("无法加载数据")
         return
 
-    mcap = data["mcap"]
-    volume = data["volume"]
-    holders = data["holders"]
+    mcap_full = data["mcap"]
+    volume_full = data["volume"]
+    holders_full = data["holders"]
+
+    # Find entry point based on custom mcap
+    entry_idx = next((i for i in range(len(mcap_full)) if mcap_full[i] >= entry_mcap), None)
+    if entry_idx is None:
+        st.warning(f"Token 市值从未达到 ${entry_mcap:,.0f}")
+        return
+
+    mcap = mcap_full[entry_idx:]
+    volume = volume_full[entry_idx:]
+    holders = holders_full[entry_idx:]
     n = len(mcap)
     entry_price = mcap[0]
 
