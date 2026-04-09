@@ -486,21 +486,38 @@ def section_regression(df):
     pair_idx = pair_labels.index(selected_pair)
     x_col, y_col, x_label, y_label = REGRESSION_PAIRS[pair_idx]
 
+    # Regression type selector
+    col_pair, col_degree = st.columns([2, 1])
+    degree = col_degree.slider("Polynomial 阶数", min_value=1, max_value=4, value=2, key="reg_degree")
+
     # Filter valid data (positive values for log)
     plot_df = organic[(organic[x_col] > 0) & (organic[y_col] > 0)].copy()
     if len(plot_df) < 5:
         st.warning("有效数据点不足")
         return
 
-    # Log-space regression
+    # Log-space polynomial regression
     log_x = np.log10(plot_df[x_col].values)
     log_y = np.log10(plot_df[y_col].values)
-    slope, intercept, r_value, p_value, std_err = sp_stats.linregress(log_x, log_y)
-    r_squared = r_value ** 2
 
-    # Regression line points
-    x_range = np.linspace(log_x.min(), log_x.max(), 100)
-    y_fit = slope * x_range + intercept
+    # Fit polynomial in log space
+    coeffs = np.polyfit(log_x, log_y, degree)
+    poly = np.poly1d(coeffs)
+
+    # R² calculation
+    y_pred = poly(log_x)
+    ss_res = np.sum((log_y - y_pred) ** 2)
+    ss_tot = np.sum((log_y - log_y.mean()) ** 2)
+    r_squared = 1 - ss_res / max(ss_tot, 1e-9)
+
+    # Also compute linear R² for comparison
+    from scipy import stats as sp_stats
+    slope_lin, intercept_lin, r_lin, p_value, _ = sp_stats.linregress(log_x, log_y)
+    r_squared_lin = r_lin ** 2
+
+    # Regression curve points (smooth)
+    x_range = np.linspace(log_x.min(), log_x.max(), 200)
+    y_fit = poly(x_range)
 
     # Build chart
     color_map = {
@@ -513,17 +530,30 @@ def section_regression(df):
                       color_discrete_map=color_map,
                       labels={x_col: x_label, y_col: y_label, "cluster_name": "Cluster"})
 
-    # Add regression line
+    # Add polynomial regression curve
     fig.add_trace(go.Scatter(
         x=10 ** x_range, y=10 ** y_fit,
         mode="lines",
         line=dict(color="#ef4444", width=3),
-        name=f"Regression (R²={r_squared:.3f})",
+        name=f"Poly-{degree} (R²={r_squared:.3f})",
         showlegend=True,
     ))
 
+    # Add confidence band (±1 std of residuals)
+    residual_std = np.std(log_y - y_pred)
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([10 ** x_range, 10 ** x_range[::-1]]),
+        y=np.concatenate([10 ** (y_fit + residual_std), 10 ** (y_fit - residual_std)[::-1]]),
+        fill="toself",
+        fillcolor="rgba(239, 68, 68, 0.1)",
+        line=dict(color="rgba(239, 68, 68, 0)"),
+        name="±1σ 置信带",
+        showlegend=True,
+    ))
+
+    degree_name = {1: "线性", 2: "二次", 3: "三次", 4: "四次"}[degree]
     fig.update_layout(
-        title=f"{x_label} vs {y_label}（{len(plot_df)} tokens, R²={r_squared:.3f}）",
+        title=f"{x_label} vs {y_label}（{len(plot_df)} tokens, {degree_name}回归 R²={r_squared:.3f}）",
         height=550,
     )
     fig.update_traces(marker=dict(size=7, opacity=0.8), selector=dict(mode="markers"))
@@ -531,30 +561,42 @@ def section_regression(df):
 
     # Regression stats
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("R²", f"{r_squared:.3f}")
-    col2.metric("斜率 (log-log)", f"{slope:.3f}")
-    col3.metric("p-value", f"{p_value:.2e}")
+    col1.metric(f"R²（{degree_name}）", f"{r_squared:.3f}")
+    col2.metric("R²（线性对比）", f"{r_squared_lin:.3f}",
+                f"{r_squared - r_squared_lin:+.3f}" if degree > 1 else None)
+    col3.metric("p-value（线性）", f"{p_value:.2e}")
     col4.metric("样本数", f"{len(plot_df)}")
+
+    # Polynomial equation
+    terms = []
+    for i, c in enumerate(coeffs):
+        power = degree - i
+        if power == 0:
+            terms.append(f"{c:.3f}")
+        elif power == 1:
+            terms.append(f"{c:.3f}·x")
+        else:
+            terms.append(f"{c:.3f}·x^{power}")
+    equation = " + ".join(terms)
 
     # Interpretation
     if r_squared > 0.5:
         strength = "强"
-        emoji = "strong"
     elif r_squared > 0.3:
         strength = "中等"
-        emoji = "moderate"
     else:
         strength = "弱"
-        emoji = "weak"
 
     st.markdown(f"""
     ### 解读
 
-    **R² = {r_squared:.3f}** — {x_label} 和 {y_label} 之间存在 **{strength}** 的对数线性关系。
+    **R² = {r_squared:.3f}** — {x_label} 和 {y_label} 之间存在 **{strength}** 的{degree_name}关系。
+    {"（比线性回归提升 " + f"{r_squared - r_squared_lin:+.3f}" + "）" if degree > 1 and r_squared > r_squared_lin else ""}
 
-    **斜率 = {slope:.3f}** — 在对数空间中，{x_label} 每增加 10 倍，{y_label} 大约增加 **{10**slope:.1f} 倍**。
+    **回归方程（对数空间）：** `log(Y) = {equation}`
 
-    **p-value = {p_value:.2e}** — {'统计显著（p < 0.05）' if p_value < 0.05 else '不显著（p >= 0.05）'}。
+    **置信带** — 红色阴影区域表示 ±1 个标准差范围，约 68% 的 token 落在此区域内。
+    落在置信带上方的 token 表现超预期，下方的则不及预期。
     """)
 
     # Per-cluster regression
@@ -565,11 +607,15 @@ def section_regression(df):
             continue
         lx = np.log10(sub[x_col].values)
         ly = np.log10(sub[y_col].values)
-        s, i, r, p, se = sp_stats.linregress(lx, ly)
+        sub_coeffs = np.polyfit(lx, ly, degree)
+        sub_poly = np.poly1d(sub_coeffs)
+        sub_pred = sub_poly(lx)
+        sub_ss_res = np.sum((ly - sub_pred) ** 2)
+        sub_ss_tot = np.sum((ly - ly.mean()) ** 2)
+        sub_r2 = 1 - sub_ss_res / max(sub_ss_tot, 1e-9)
         meta = CLUSTER_META.get(rank, {})
         st.markdown(f"- **#{rank} {meta.get('name', '?')}** ({len(sub)} tokens): "
-                    f"R²={r**2:.3f}, 斜率={s:.3f}, "
-                    f"{'显著' if p < 0.05 else '不显著'} (p={p:.2e})")
+                    f"R²={sub_r2:.3f}")
 
 
 def section_query(df, model):
