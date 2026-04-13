@@ -1,7 +1,7 @@
 """Token Discovery Pipeline — automated scan + classify + filter.
 
 Runs one cycle:
-1. Codex API → trending launchpad tokens (4h, Solana)
+1. Codex API → trending launchpad tokens (24h, Solana)
 2. GMGN API → hourly candle history per token
 3. Compute 11 lifecycle features
 4. KMeans predict cluster
@@ -131,7 +131,7 @@ def scan_codex():
           potentialScam: false
         }}
         statsType: FILTERED
-        rankings: [{{attribute: trendingScore4, direction: DESC}}]
+        rankings: [{{attribute: trendingScore24, direction: DESC}}]
         limit: 200
         offset: 0
       ) {{
