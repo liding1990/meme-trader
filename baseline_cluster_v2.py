@@ -182,10 +182,13 @@ def compute_features(address):
     max_holders = 0
 
     if holder_df is not None and len(holder_df) >= 2:
-        # Merge holders onto candle timeline
+        # Merge holders onto candle timeline (normalize datetime resolution for pandas 3.x)
+        candle_dt = df[["datetime"]].iloc[start_idx:end_idx + 1].copy()
+        candle_dt["datetime"] = pd.to_datetime(candle_dt["datetime"], utc=True).dt.tz_localize(None)
+        holder_df = holder_df.copy()
+        holder_df["datetime"] = pd.to_datetime(holder_df["datetime"], utc=True).dt.tz_localize(None)
         h_merged = pd.merge_asof(
-            df[["datetime"]].iloc[start_idx:end_idx + 1],
-            holder_df, on="datetime", direction="backward"
+            candle_dt, holder_df, on="datetime", direction="backward"
         )
         if "holders" in h_merged.columns and h_merged["holders"].notna().sum() > 0:
             h_vals = h_merged["holders"].ffill().bfill().values
