@@ -109,7 +109,7 @@ def load_trajectories(addresses):
             cdf = pd.DataFrame(candles)
             cdf["mcap"] = cdf["close"].astype(float)
             cdf["volume"] = cdf["volume"].astype(float)
-            cdf["datetime"] = pd.to_datetime(cdf["time"].astype(int), unit="ms")
+            cdf["datetime"] = pd.to_datetime(cdf["time"].astype(int), unit="ms").astype("datetime64[s]")
             cdf = cdf.sort_values("datetime").reset_index(drop=True)
 
             # Window: first $100K → end
