@@ -97,7 +97,7 @@ def load_holders(address):
                 data = json.load(f)
             if data:
                 df = pd.DataFrame(data)
-                df["datetime"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None)
+                df["datetime"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_localize(None).astype("datetime64[s]")
                 df["holders"] = df["totalHolders"].astype(float)
                 return df[["datetime", "holders"]].sort_values("datetime").reset_index(drop=True)
         except Exception:
@@ -114,7 +114,7 @@ def load_holders(address):
         if not series:
             return None
         df = pd.DataFrame(series)
-        df["datetime"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
+        df["datetime"] = pd.to_datetime(df["timestamp"].astype(int), unit="s").astype("datetime64[s]")
         df["holders"] = df["value"].astype(float)
         return df[["datetime", "holders"]].sort_values("datetime").reset_index(drop=True)
     except Exception:

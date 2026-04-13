@@ -130,7 +130,7 @@ def load_trajectories(addresses):
                         hdata = json.load(f)
                     if hdata:
                         hdf = pd.DataFrame(hdata)
-                        hdf["datetime"] = pd.to_datetime(hdf["timestamp"], utc=True).dt.tz_localize(None)
+                        hdf["datetime"] = pd.to_datetime(hdf["timestamp"], utc=True).dt.tz_localize(None).astype("datetime64[s]")
                         hdf["holders"] = hdf["totalHolders"].astype(float)
                         hdf = hdf.set_index("datetime").resample("1h").last().ffill().reset_index()
                         merged = pd.merge_asof(cdf[["datetime", "mcap", "volume", "hours"]],
